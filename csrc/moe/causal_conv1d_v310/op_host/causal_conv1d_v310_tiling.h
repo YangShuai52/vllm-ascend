@@ -32,6 +32,7 @@ BEGIN_TILING_DATA_DEF(CausalConv1dTilingData)
     TILING_DATA_FIELD_DEF(int64_t, cuSeqlen);
     TILING_DATA_FIELD_DEF(int64_t, seqLen);
     TILING_DATA_FIELD_DEF(int64_t, inputMode);
+    TILING_DATA_FIELD_DEF(int64_t, runMode);
 
     TILING_DATA_FIELD_DEF(int64_t, width);
 
@@ -47,6 +48,11 @@ BEGIN_TILING_DATA_DEF(CausalConv1dTilingData)
 
     TILING_DATA_FIELD_DEF(int64_t, dimTileSize);
     TILING_DATA_FIELD_DEF(int64_t, blocksPerSeq);
+
+    TILING_DATA_FIELD_DEF(int64_t, hasNumAcceptedTokens);
+
+    TILING_DATA_FIELD_DEF(int64_t, hasCacheIndices);
+    TILING_DATA_FIELD_DEF(int64_t, hasInitialStateMode);
 END_TILING_DATA_DEF;
 struct CausalConv1dCompileInfo {
     uint64_t ubSize = 0;
