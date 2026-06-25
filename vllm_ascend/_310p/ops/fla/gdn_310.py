@@ -126,9 +126,6 @@ def _fused_gdn_gating_310(
     The AscendC custom op is only used on eager paths; during capture we keep
     the PyTorch fallback that was already graph-stable before op integration.
     """
-    if _EXTRA_CTX.capturing:
-        return fused_gdn_gating_pytorch(a_log, a, b, dt_bias, beta=beta, threshold=threshold)
-
     compute_dtype = a.dtype
     return torch.ops._C_ascend.npu_fused_gdn_gating(
         a_log.to(compute_dtype),
