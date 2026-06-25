@@ -111,6 +111,35 @@ def _register_310_conv1d_buffer_replay(
     graph_params.conv1d_events[num_actual_tokens].append(None)
 
 
+def _fused_gdn_gating_310(
+    a_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    beta: float = 1.0,
+    threshold: float = 20.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run fused GDN gating on 310P.
+
+    ACL graph capture replays recorded kernels without re-entering Python.
+    The AscendC custom op is only used on eager paths; during capture we keep
+    the PyTorch fallback that was already graph-stable before op integration.
+    """
+    if _EXTRA_CTX.capturing:
+        return fused_gdn_gating_pytorch(a_log, a, b, dt_bias, beta=beta, threshold=threshold)
+
+    compute_dtype = a.dtype
+    return torch.ops._C_ascend.npu_fused_gdn_gating(
+        a_log.to(compute_dtype),
+        a,
+        b,
+        dt_bias.to(compute_dtype),
+        beta,
+        threshold,
+    )
+
+
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return F.normalize(x.to(torch.float32), p=2, dim=-1, eps=eps).to(x.dtype)
 
@@ -374,7 +403,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
-        g, beta = fused_gdn_gating_pytorch(self.A_log, a, b, self.dt_bias)
+        g, beta = _fused_gdn_gating_310(self.A_log, a, b, self.dt_bias)
         if attn_metadata.num_prefills > 0 or spec_sequence_masks is not None:
             if spec_sequence_masks is not None:
                 if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:

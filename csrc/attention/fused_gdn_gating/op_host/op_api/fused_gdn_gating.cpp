@@ -29,20 +29,16 @@ static constexpr FusedGdnGatingOutput kNullOutput{nullptr, nullptr};
 FusedGdnGatingOutput FusedGdnGating(const aclTensor *aLog, const aclTensor *a,
                                     const aclTensor *b, const aclTensor *dtBias,
                                     float beta, float threshold,
+                                    aclTensor *g, aclTensor *betaOutput,
                                     aclOpExecutor *executor)
 {
     L0_DFX(FusedGdnGating, aLog, a, b, dtBias, beta, threshold);
 
-    const DataType betaDtype = b->GetDataType();
-    const Format format = Format::FORMAT_ND;
-
-    auto g = executor->AllocTensor(DataType::DT_FLOAT, format, format);
-    OP_CHECK(g != nullptr, OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "g AllocTensor failed."),
+    OP_CHECK(g != nullptr,
+             OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "g output tensor is null."),
              return kNullOutput);
-
-    auto betaOutput = executor->AllocTensor(betaDtype, format, format);
     OP_CHECK(betaOutput != nullptr,
-             OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "beta_output AllocTensor failed."),
+             OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "beta_output tensor is null."),
              return kNullOutput);
 
     auto ret = INFER_SHAPE(FusedGdnGating,

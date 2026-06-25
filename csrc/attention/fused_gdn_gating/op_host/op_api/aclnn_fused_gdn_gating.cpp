@@ -105,26 +105,26 @@ aclnnStatus aclnnFusedGdnGatingGetWorkspaceSize(
     FusedGdnGatingParams params{aLog, a, b, dtBias, beta, threshold, g, betaOutput};
     CHECK_RET(CheckParams(params) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
 
-    // Bring inputs to a contiguous form that the kernel expects.
+    // Bring inputs/outputs to a contiguous form that the kernel expects.
     auto aLogContig   = l0op::Contiguous(aLog,   uniqueExecutor.get());
     auto aContig      = l0op::Contiguous(a,      uniqueExecutor.get());
     auto bContig      = l0op::Contiguous(b,      uniqueExecutor.get());
     auto dtBiasContig = l0op::Contiguous(dtBias, uniqueExecutor.get());
+    auto gContig      = l0op::Contiguous(g,      uniqueExecutor.get());
+    auto betaContig   = l0op::Contiguous(betaOutput, uniqueExecutor.get());
     CHECK_RET(aLogContig   != nullptr, ACLNN_ERR_INNER_NULLPTR);
     CHECK_RET(aContig      != nullptr, ACLNN_ERR_INNER_NULLPTR);
     CHECK_RET(bContig      != nullptr, ACLNN_ERR_INNER_NULLPTR);
     CHECK_RET(dtBiasContig != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    CHECK_RET(gContig      != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    CHECK_RET(betaContig   != nullptr, ACLNN_ERR_INNER_NULLPTR);
 
+    // Write directly into caller-provided outputs to keep ACL graph replay stable.
     auto result = l0op::FusedGdnGating(aLogContig, aContig, bContig, dtBiasContig,
-                                       beta, threshold, uniqueExecutor.get());
+                                       beta, threshold, gContig, betaContig,
+                                       uniqueExecutor.get());
     CHECK_RET(result.g != nullptr && result.beta_output != nullptr,
               ACLNN_ERR_INNER_NULLPTR);
-
-    // Copy kernel results into the caller-provided output tensors.
-    auto vcG = l0op::ViewCopy(result.g, g, uniqueExecutor.get());
-    CHECK_RET(vcG != nullptr, ACLNN_ERR_INNER_NULLPTR);
-    auto vcBeta = l0op::ViewCopy(result.beta_output, betaOutput, uniqueExecutor.get());
-    CHECK_RET(vcBeta != nullptr, ACLNN_ERR_INNER_NULLPTR);
 
     *workspaceSize = uniqueExecutor->GetWorkspaceSize();
     uniqueExecutor.ReleaseTo(executor);

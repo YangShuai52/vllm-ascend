@@ -38,15 +38,20 @@ std::tuple<at::Tensor, at::Tensor> npu_fused_gdn_gating(
     int64_t batch = a.size(0);
     int64_t num_heads = a.size(1);
 
+    auto a_contig = a.contiguous();
+    auto b_contig = b.contiguous();
+    auto a_log_contig = A_log.contiguous();
+    auto dt_bias_contig = dt_bias.contiguous();
+
     at::Tensor g = at::empty({1, batch, num_heads},
-                             a.options().dtype(c10::kFloat));
-    at::Tensor beta_output = at::empty({1, batch, num_heads}, b.options());
+                             a_contig.options().dtype(c10::kFloat));
+    at::Tensor beta_output = at::empty({1, batch, num_heads}, b_contig.options());
 
     float beta_val = static_cast<float>(beta);
     float threshold_val = static_cast<float>(threshold);
 
     EXEC_NPU_CMD(aclnnFusedGdnGating,
-                 A_log, a, b, dt_bias,
+                 a_log_contig, a_contig, b_contig, dt_bias_contig,
                  beta_val,
                  threshold_val,
                  g, beta_output);
