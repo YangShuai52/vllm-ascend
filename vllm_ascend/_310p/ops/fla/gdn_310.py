@@ -481,6 +481,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
                     initial_state=initial_state,
                     output_final_state=True,
                     cu_seqlens=non_spec_query_start_loc,
+                    cu_seqlens_cpu=getattr(attn_metadata, "non_spec_query_start_loc_cpu", None),
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
                 )

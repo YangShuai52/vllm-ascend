@@ -462,8 +462,8 @@ class NPUModelRunner310(NPUModelRunner):
             self.num_accepted_tokens.copy_to_gpu()
         else:
             if is_rc_device():
-                self.num_accepted_tokens.np[num_reqs:].fill(1)
-                self.num_accepted_tokens.copy_to_gpu()
+                self.num_accepted_tokens.np.fill(1)
+                self.num_accepted_tokens.gpu.copy_(self.num_accepted_tokens.cpu, non_blocking=False)
             else:
                 self.num_accepted_tokens.np.fill(1)
                 self.num_accepted_tokens.gpu.fill_(1)
@@ -475,7 +475,7 @@ class NPUModelRunner310(NPUModelRunner):
             self.prev_positions.copy_to_gpu(num_reqs)
             self.prev_num_draft_tokens.copy_to_gpu()
             cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
-                device=self.device, non_blocking=True
+                device=self.device, non_blocking=not is_rc_device()
             )
             update_num_computed_tokens_for_batch_change(
                 self.num_computed_tokens,
@@ -508,13 +508,14 @@ class NPUModelRunner310(NPUModelRunner):
                 tail_len = self.seq_lens.shape[0] - num_reqs
                 if tail_len > 0:
                     self.seq_lens[num_reqs:].copy_(
-                        self.optimistic_seq_lens_cpu[num_reqs:].to(self.device, non_blocking=True),
+                        self.optimistic_seq_lens_cpu[num_reqs : self.seq_lens.shape[0]],
+                        non_blocking=False,
                     )
         else:
             if is_rc_device():
                 self.seq_lens.copy_(
                     self.optimistic_seq_lens_cpu[: self.seq_lens.shape[0]],
-                    non_blocking=True,
+                    non_blocking=False,
                 )
             else:
                 self.seq_lens[:num_reqs].copy_(

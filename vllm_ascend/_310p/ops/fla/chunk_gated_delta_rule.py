@@ -489,6 +489,7 @@ def chunk_gated_delta_rule_310(
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -523,8 +524,11 @@ def chunk_gated_delta_rule_310(
         chunk_indices_list = None
         num_states = q.shape[0]
     else:
+        cu_seqlens_host = cu_seqlens_cpu
+        if cu_seqlens_host is None:
+            cu_seqlens_host = cu_seqlens.to(torch.int64).cpu()
         q_pad, k_pad, v_pad, g_pad, beta_pad, seq_ranges, cu_kernel = _pad_varlen_to_chunk(
-            q, k, v, g, beta, cu_seqlens.to(torch.int64).cpu(), CHUNK_SIZE
+            q, k, v, g, beta, cu_seqlens_host.to(torch.int64), CHUNK_SIZE
         )
         assert cu_kernel is not None
         cu_list = cu_kernel.tolist()

@@ -48,8 +48,8 @@ def compute_causal_conv1d_metadata(
         batch_ptr_cpu[:mlist_len].copy_(mlist.to(torch.int32))
         token_chunk_offset_ptr_cpu[:mlist_len].copy_(offsetlist)
         if device.type != "cpu":
-            batch_ptr.copy_(batch_ptr_cpu, non_blocking=True)
-            token_chunk_offset_ptr.copy_(token_chunk_offset_ptr_cpu, non_blocking=True)
+            batch_ptr.copy_(batch_ptr_cpu, non_blocking=False)
+            token_chunk_offset_ptr.copy_(token_chunk_offset_ptr_cpu, non_blocking=False)
 
         nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
         nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr

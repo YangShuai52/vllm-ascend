@@ -73,11 +73,18 @@ class GDNAttentionMetadataBuilder310(AscendGDNAttentionMetadataBuilder):
         # uninitialized SSM state -> garbage output.
         num_computed_tokens_cpu = getattr(m, "_num_computed_tokens_cpu", None)
         if num_computed_tokens_cpu is None:
-            num_computed_tokens_cpu = getattr(m, "num_computed_tokens_cpu", None)
+            num_computed_tokens_cpu = getattr(m, "__dict__", {}).get("num_computed_tokens_cpu")
         if num_computed_tokens_cpu is not None:
             context_lens_cpu = num_computed_tokens_cpu
         else:
-            context_lens_cpu = context_lens_tensor.detach().cpu()
+            seq_lens_cpu = getattr(m, "_seq_lens_cpu", None)
+            if seq_lens_cpu is None:
+                seq_lens_cpu = getattr(m, "seq_lens_cpu_upper_bound", None)
+            if seq_lens_cpu is not None:
+                query_lens_cpu = m.query_start_loc_cpu[1:] - m.query_start_loc_cpu[:-1]
+                context_lens_cpu = seq_lens_cpu[: query_lens_cpu.numel()] - query_lens_cpu
+            else:
+                context_lens_cpu = context_lens_tensor.detach().cpu()
 
         has_initial_state_cpu = context_lens_cpu > 0
         if spec_sequence_masks_cpu is not None:
@@ -85,7 +92,7 @@ class GDNAttentionMetadataBuilder310(AscendGDNAttentionMetadataBuilder):
 
         has_initial_state = has_initial_state_cpu.to(
             query_start_loc.device,
-            non_blocking=True,
+            non_blocking=False,
         )
         nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
             non_spec_query_start_loc_cpu,
@@ -99,7 +106,8 @@ class GDNAttentionMetadataBuilder310(AscendGDNAttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         non_spec_query_start_loc_cpu: torch.Tensor | None,
     ) -> GDNAttentionMetadata:
-        del common_attn_metadata, non_spec_query_start_loc_cpu
+        del common_attn_metadata
+        attn_metadata.non_spec_query_start_loc_cpu = non_spec_query_start_loc_cpu
         return attn_metadata
 
     def _attach_spec_decode_fallback_meta(
