@@ -1,10 +1,16 @@
+import psutil
 import torch
 
-from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.utils import is_rc_device, vllm_version_is
 
 
 def patch_empty_cache() -> None:
     torch.npu.empty_cache()
+
+
+def _get_rc_memory_info(*args, **kwargs):
+    vmem = psutil.virtual_memory()
+    return vmem.available, vmem.total
 
 
 torch.accelerator.empty_cache = patch_empty_cache
@@ -16,6 +22,13 @@ torch.accelerator.empty_cache = patch_empty_cache
 torch.accelerator.memory_stats = torch.npu.memory_stats  # type: ignore[attr-defined]
 torch.accelerator.memory_reserved = torch.npu.memory_reserved  # type: ignore[attr-defined]
 torch.accelerator.reset_peak_memory_stats = torch.npu.reset_peak_memory_stats  # type: ignore[attr-defined]
+
+# 310P RC devices share host and device memory. The driver-reported values
+# from torch.npu.mem_get_info are incorrect, so always use psutil on RC
+# regardless of the vLLM version.
+if is_rc_device():
+    torch.npu.mem_get_info = _get_rc_memory_info  # type: ignore[method-assign]
+
 if not vllm_version_is("0.23.0"):
     # torch.accelerator.get_memory_info() routes through c10's
     # CachingDeviceAllocator and asserts the backend allocator is a

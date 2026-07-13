@@ -50,6 +50,7 @@ from vllm_ascend.utils import (
     refresh_block_size,
     update_cudagraph_capture_sizes,
     is_310p,
+    is_rc_device,
     enable_sp,
 )
 
@@ -152,6 +153,16 @@ class NPUPlatform(Platform):
         # ModelConfig validation runs before custom-op init, so avoid importing
         # the extension and just declare support.
         return True
+
+    @classmethod
+    def is_integrated_gpu(cls, device_id: int = 0) -> bool:
+        """Return True when host and NPU share physical memory (310P RC).
+
+        vLLM uses this to route ``MemorySnapshot.measure()`` through
+        ``psutil.virtual_memory().available`` instead of device-reported
+        free memory, which underreports on unified-memory systems.
+        """
+        return is_rc_device()
 
     @property
     def pass_key(self) -> str:

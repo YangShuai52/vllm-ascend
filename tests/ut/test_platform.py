@@ -84,6 +84,14 @@ class TestNPUPlatform(TestBase):
     def test_is_sleep_mode_available(self):
         self.assertTrue(self.platform.is_sleep_mode_available())
 
+    @patch("vllm_ascend.platform.is_rc_device", return_value=True)
+    def test_is_integrated_gpu_true_on_rc_device(self, _mock_is_rc_device):
+        self.assertTrue(NPUPlatform.is_integrated_gpu())
+
+    @patch("vllm_ascend.platform.is_rc_device", return_value=False)
+    def test_is_integrated_gpu_false_on_non_rc_device(self, _mock_is_rc_device):
+        self.assertFalse(NPUPlatform.is_integrated_gpu())
+
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")
     def test_pre_register_and_update_with_parser(self, mock_quant_config, mock_adapt_patch):

@@ -78,10 +78,6 @@ class NPUWorker310(NPUWorker):
         ) as profile_result:
             self.model_runner.profile_run()
             free_memory, total_memory = torch.npu.mem_get_info()
-            # The host memory or device memory for RC devices refers to the available portion of memory
-            # which cannot be obtained via torch.npu.mem_get_info()
-            if is_rc_device():
-                free_memory = psutil.virtual_memory().available
             torch_memory = torch.npu.memory_reserved()
             non_torch_memory_before_empty_cache = total_memory - free_memory - torch_memory
 
@@ -143,7 +139,6 @@ class NPUWorker310(NPUWorker):
             self.init_snapshot = MemorySnapshot(device=device)
         self.requested_memory = self.init_snapshot.total_memory * self.cache_config.gpu_memory_utilization
         if is_rc_device():
-            self.init_snapshot.free_memory = psutil.virtual_memory().available
             logger.info_once("Root Complex (RC) mode: host and device memory are shared.")
         if self.init_snapshot.free_memory < self.requested_memory:
             GiB = lambda b: round(b / GiB_bytes, 2)
