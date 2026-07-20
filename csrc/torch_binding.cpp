@@ -2250,6 +2250,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "chunk_fwd_o(Tensor q, Tensor k, Tensor v, Tensor h, float scale, *, Tensor? g=None, Tensor? g_gamma=None, int[]? cu_seqlens=None, int[]? chunk_indices=None, int? chunk_size=None, bool? transpose_state_layout=False) -> Tensor"
     );
     ops.impl("chunk_fwd_o", torch::kPrivateUse1, &vllm_ascend::chunk_fwd_o);
+
+    ops.def(
+        "npu_fused_gdn_gating(Tensor A_log, "
+        "                     Tensor a, "
+        "                     Tensor b, "
+        "                     Tensor dt_bias, "
+        "                     float beta=1.0, "
+        "                     float threshold=20.0) -> (Tensor g, Tensor beta_output)");
+    ops.impl("npu_fused_gdn_gating", torch::kPrivateUse1, &vllm_ascend::npu_fused_gdn_gating);
 }
 #else
 // Pybind on other platform
