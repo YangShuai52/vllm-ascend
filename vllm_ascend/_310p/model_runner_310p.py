@@ -53,6 +53,7 @@ from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.spec_decode.utils import (
+    correct_optimistic_seq_lens_cpu,
     update_num_computed_tokens_for_batch_change,
 )
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, is_rc_device, lmhead_tp_enable
@@ -310,6 +311,7 @@ class NPUModelRunner310(NPUModelRunner):
         if need_async_num_computed_update:
             self.prev_positions.copy_to_gpu(num_reqs)
             self.prev_num_draft_tokens.copy_to_gpu()
+            # Capture optimistic CPU values before correcting them in place.
             cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
                 device=self.device, non_blocking=True
             )
@@ -321,9 +323,20 @@ class NPUModelRunner310(NPUModelRunner):
                 self.prev_num_draft_tokens.gpu,
                 cpu_values,
             )
-            # Make sure D2H is synchronized.
-            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].copy_(
-                self.num_computed_tokens[:num_reqs], non_blocking=False
+            # 310P builds positions/slot_mapping on CPU, so num_computed_tokens_cpu
+            # must be corrected before the numpy path below. Prefer the same
+            # CPU-side drift correction as 910B over a blocking NPU->CPU copy of
+            # the GPU result: valid_sampled_token_count was async-copied last
+            # step, so this event sync is typically a no-op in steady state.
+            assert self.valid_sampled_token_count_event is not None
+            assert self.valid_sampled_token_count_cpu is not None
+            self.valid_sampled_token_count_event.synchronize()
+            correct_optimistic_seq_lens_cpu(
+                self.input_batch.num_computed_tokens_cpu,
+                self.prev_positions.np,
+                self.prev_num_draft_tokens.np,
+                self.valid_sampled_token_count_cpu.numpy(),
+                num_reqs,
             )
         else:
             self.num_computed_tokens[:num_reqs].copy_(

@@ -184,3 +184,36 @@ def test_cpu_and_gpu_corrections_agree():
     gpu_seq_lens = num_computed_gpu.numpy() + num_scheduled_step_n
 
     np.testing.assert_array_equal(optimistic, gpu_seq_lens)
+
+
+def test_correct_num_computed_tokens_cpu_matches_gpu():
+    """310P corrects ``num_computed_tokens_cpu`` in place instead of D2H.
+
+    The CPU drift helper must match ``update_num_computed_tokens_for_batch_change``
+    when applied directly to optimistic ``num_computed_tokens_cpu``.
+    """
+    num_reqs = 6
+    prev_step_computed = np.array([100, 250, 80, 0, 410, 5], dtype=np.int32)
+    prev_drafts = np.array([2, 4, 0, 0, 3, 1], dtype=np.int32)
+    accepted = np.array([2, 1, 0, 0, 0, 1], dtype=np.int32)
+    valid_count = (accepted + 1).astype(np.int32)
+    prev_positions = np.array([0, 1, 2, -1, 4, 5], dtype=np.int32)
+
+    optimistic_num_computed = (prev_step_computed + prev_drafts + 1).astype(np.int32)
+    correct_optimistic_seq_lens_cpu(
+        optimistic_num_computed, prev_positions, prev_drafts, valid_count, num_reqs
+    )
+
+    cpu_num_computed = torch.from_numpy(prev_step_computed + prev_drafts + 1).to(torch.int32)
+    num_computed_gpu = torch.from_numpy(prev_step_computed.copy()).to(torch.int32)
+    num_accepted_gpu = torch.zeros(num_reqs, dtype=torch.int32)
+    update_num_computed_tokens_for_batch_change(
+        num_computed_gpu,
+        num_accepted_gpu,
+        torch.from_numpy(prev_positions),
+        torch.from_numpy(valid_count),
+        torch.from_numpy(prev_drafts),
+        cpu_num_computed,
+    )
+
+    np.testing.assert_array_equal(optimistic_num_computed, num_computed_gpu.numpy())
