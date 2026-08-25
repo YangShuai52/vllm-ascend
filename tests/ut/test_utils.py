@@ -505,3 +505,80 @@ def test_is_pd_decode_recompute_scheduler_enabled_decode_consumer_disabled():
     ascend_config.scheduler_config.recompute_scheduler_enable = False
     with mock.patch("vllm_ascend.utils.get_ascend_config", return_value=ascend_config):
         assert utils.is_pd_decode_recompute_scheduler_enabled(vllm_config) is False
+
+
+def test_should_reuse_topk_keeps_frequency_logic():
+    config = SimpleNamespace(index_topk_freq=4, index_skip_topk_offset=3)
+
+    assert not utils.should_reuse_topk(config, 2)
+    assert utils.should_reuse_topk(config, 3)
+
+
+def test_indexshare_pp_stage_requires_topk_inside_group():
+    config = SimpleNamespace(
+        num_hidden_layers=8,
+        indexer_types=["full", "shared", "shared", "shared"] * 2,
+    )
+
+    assert utils.pp_stage_requires_topk_indices(config, 2)
+    assert not utils.pp_stage_requires_topk_indices(config, 4)
+
+
+def test_index_cache_pp_stage_requires_topk_when_first_layer_reuses():
+    config = SimpleNamespace(
+        num_hidden_layers=8,
+        use_index_cache=True,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+    )
+
+    assert utils.pp_stage_requires_topk_indices(config, 3)
+    assert not utils.pp_stage_requires_topk_indices(config, 2)
+
+
+def test_pp_intermediate_tensor_placeholder_and_buffer_copy():
+    buffer = torch.zeros((4, 2), dtype=torch.int32)
+    intermediate_tensors = utils.IntermediateTensors({})
+    utils.add_pp_intermediate_tensor_placeholder(
+        intermediate_tensors,
+        "test_tensor",
+        batch_size=2,
+        buffer=buffer,
+        device=torch.device("cpu"),
+    )
+
+    assert intermediate_tensors["test_tensor"].shape == (2, 2)
+    assert intermediate_tensors["test_tensor"].dtype == torch.int32
+
+    intermediate_tensors.tensors["test_tensor"] = torch.tensor(
+        [[1, 2], [3, 4]],
+        dtype=torch.int32,
+    )
+    utils.copy_pp_intermediate_tensor_to_buffer(
+        intermediate_tensors,
+        "test_tensor",
+        buffer,
+    )
+    torch.testing.assert_close(buffer[:2], intermediate_tensors["test_tensor"])
+
+
+def test_copy_pp_intermediate_tensor_rejects_incompatible_shape():
+    intermediate_tensors = utils.IntermediateTensors({"test_tensor": torch.zeros((2, 3), dtype=torch.int32)})
+
+    with pytest.raises(ValueError, match="unexpected shape"):
+        utils.copy_pp_intermediate_tensor_to_buffer(
+            intermediate_tensors,
+            "test_tensor",
+            torch.zeros((4, 2), dtype=torch.int32),
+        )
+
+
+def test_copy_pp_intermediate_tensor_rejects_excess_tokens():
+    intermediate_tensors = utils.IntermediateTensors({"test_tensor": torch.zeros((5, 2), dtype=torch.int32)})
+
+    with pytest.raises(ValueError, match="exceeds the local buffer capacity"):
+        utils.copy_pp_intermediate_tensor_to_buffer(
+            intermediate_tensors,
+            "test_tensor",
+            torch.zeros((4, 2), dtype=torch.int32),
+        )

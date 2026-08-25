@@ -9,8 +9,6 @@ import vllm_ascend.patch.worker.patch_deepseek_v2 as patch_deepseek_v2
 from vllm_ascend.patch.worker.patch_deepseek_v2 import (
     _PP_TOPK_INDICES_KEY,
     _patched_forward,
-    _pp_stage_needs_topk_indices,
-    _should_reuse_topk,
     _should_skip_indexer_init,
 )
 
@@ -44,35 +42,6 @@ def test_mtp_layer_keeps_indexer():
         "model.layers.80.self_attn",
         skip_topk=True,
     )
-
-
-def test_should_reuse_topk_keeps_existing_frequency_logic():
-    config = _config(index_topk_freq=4, index_skip_topk_offset=3)
-
-    assert not _should_reuse_topk(config, 2)
-    assert _should_reuse_topk(config, 3)
-
-
-def test_indexshare_stage_requests_topk_when_boundary_starts_in_group():
-    config = _config(
-        num_hidden_layers=8,
-        indexer_types=["full", "shared", "shared", "shared"] * 2,
-    )
-
-    assert _pp_stage_needs_topk_indices(config, 2)
-    assert not _pp_stage_needs_topk_indices(config, 4)
-
-
-def test_index_cache_stage_requests_topk_when_first_layer_skips():
-    config = _config(
-        num_hidden_layers=8,
-        use_index_cache=True,
-        index_topk_freq=4,
-        index_skip_topk_offset=3,
-    )
-
-    assert _pp_stage_needs_topk_indices(config, 3)
-    assert not _pp_stage_needs_topk_indices(config, 2)
 
 
 def test_pp_forward_restores_and_propagates_topk_indices(monkeypatch):

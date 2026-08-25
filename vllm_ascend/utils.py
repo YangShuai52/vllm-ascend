@@ -125,6 +125,73 @@ def model_uses_sfa_sparse(model_config: Any | None) -> bool:
     )
 
 
+def should_reuse_topk(config: Any, layer_id: int) -> bool:
+    """Return whether a layer reuses previously computed Top-K indices."""
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is None:
+        index_topk_freq = getattr(config, "index_topk_freq", 1)
+        index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
+        return max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
+    return 0 <= layer_id < len(index_topk_pattern) and index_topk_pattern[layer_id] == "S"
+
+
+def pp_stage_requires_topk_indices(config: Any, start_layer: int) -> bool:
+    """Return whether a PP stage needs Top-K indices from its predecessor."""
+    num_hidden_layers = getattr(config, "num_hidden_layers", 0)
+    if start_layer <= 0 or start_layer >= num_hidden_layers:
+        return False
+
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        for layer_id in range(start_layer, min(len(indexer_types), num_hidden_layers)):
+            indexer_type = indexer_types[layer_id]
+            if not isinstance(indexer_type, str):
+                continue
+            indexer_type = indexer_type.lower()
+            if indexer_type == "full":
+                return False
+            if indexer_type == "shared":
+                return True
+
+    return bool(getattr(config, "use_index_cache", False)) and should_reuse_topk(config, start_layer)
+
+
+def add_pp_intermediate_tensor_placeholder(
+    intermediate_tensors: IntermediateTensors,
+    tensor_name: str,
+    batch_size: int,
+    buffer: torch.Tensor,
+    device: torch.device,
+) -> None:
+    """Add a receive placeholder matching a PP intermediate tensor buffer."""
+    intermediate_tensors.tensors[tensor_name] = torch.zeros(
+        (batch_size, *buffer.shape[1:]),
+        dtype=buffer.dtype,
+        device=device,
+    )
+
+
+def copy_pp_intermediate_tensor_to_buffer(
+    intermediate_tensors: IntermediateTensors,
+    tensor_name: str,
+    buffer: torch.Tensor,
+) -> None:
+    """Copy a received PP intermediate tensor into a reusable local buffer."""
+    received_tensor = intermediate_tensors[tensor_name]
+    if received_tensor.shape[1:] != buffer.shape[1:]:
+        raise ValueError(
+            f"Received PP intermediate tensor '{tensor_name}' has an unexpected shape: "
+            f"received {tuple(received_tensor.shape)}, buffer {tuple(buffer.shape)}."
+        )
+    num_tokens = received_tensor.shape[0]
+    if num_tokens > buffer.shape[0]:
+        raise ValueError(
+            f"Received PP intermediate tensor '{tensor_name}' exceeds the local buffer capacity: "
+            f"received {num_tokens} tokens, capacity {buffer.shape[0]}."
+        )
+    buffer[:num_tokens].copy_(received_tensor)
+
+
 def enable_sfa_dcp_replicated_indexer(vllm_config: VllmConfig | None = None) -> bool:
     if vllm_config is None:
         from vllm.config import get_current_vllm_config
