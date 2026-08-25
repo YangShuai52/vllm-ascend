@@ -98,7 +98,8 @@ def test_runner_310_installs_specialized_comm():
     runner = _build_runner()
     moe_config = MagicMock()
     runner.moe_config = moe_config
-    runner.gate = None
+    gate = SimpleNamespace()
+    runner.gate = gate
     routed_experts = SimpleNamespace(quant_config=None, quant_method=None)
     runner.ascend_shared_experts = SimpleNamespace(multistream_overlap=True)
     comm_method = object()
@@ -119,6 +120,7 @@ def test_runner_310_installs_specialized_comm():
         assert routed_experts.quant_method is None
         assert runner.ascend_shared_experts.multistream_overlap is False
         assert fused_moe_310_module._MoECommMethods[MoECommType.ALLGATHER] is comm_method
+        assert not hasattr(gate, "precast_fp32_weight")
         parent_init.assert_called_once()
 
 
@@ -266,3 +268,49 @@ def test_forward_impl_310_returns_current_runner_contract(monkeypatch, has_share
         )
         assert result is routed_out
         ascend_shared_experts.forward.assert_not_called()
+
+
+@pytest.mark.parametrize("has_shared_experts", [False, True])
+def test_forward_impl_310_uses_gate_model_dtype(monkeypatch, has_shared_experts):
+    runner = _build_runner()
+    hidden_states = torch.randn(2, 4, dtype=torch.float16)
+    router_logits = torch.randn(2, 3, dtype=torch.float16)
+    routed_out = torch.randn(2, 4, dtype=torch.float16)
+    shared_out = torch.randn(2, 4, dtype=torch.float16)
+    gate = MagicMock(return_value=(router_logits, None))
+    routed_events = FusedMoEEvents(
+        before_routed_experts=None,
+        after_routed_experts=None,
+        before_dispatch=None,
+        before_gmm2=None,
+        before_combine=None,
+    )
+    runner.gate = gate
+    runner.ascend_shared_experts = (
+        SimpleNamespace(forward=MagicMock(return_value=shared_out)) if has_shared_experts else None
+    )
+    runner.routed_experts = SimpleNamespace(
+        forward_impl=MagicMock(return_value=(routed_out, routed_events) if has_shared_experts else routed_out)
+    )
+    runner._sequence_parallel_context = MagicMock(return_value=nullcontext())
+
+    monkeypatch.setattr(AscendMoERunner310, "is_internal_router", property(lambda _: True))
+    monkeypatch.setattr(fused_moe_310_module.torch.npu, "current_stream", MagicMock())
+
+    result = runner._forward_impl(
+        hidden_states,
+        torch.empty_like(router_logits),
+        shared_experts_input=None,
+    )
+
+    gate.assert_called_once_with(hidden_states)
+    runner.routed_experts.forward_impl.assert_called_once_with(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        input_ids=None,
+    )
+    if has_shared_experts:
+        assert result[0] is shared_out
+        assert result[1] is routed_out
+    else:
+        assert result is routed_out

@@ -129,12 +129,52 @@ class AscendMoERunner310(AscendMoERunner):
             routed_output_transform=routed_output_transform,
             routed_scaling_factor=routed_scaling_factor,
         )
-        if self.is_internal_router and self.gate is not None and not hasattr(self.gate, "weight_fp32"):
-            # Pre-cast the internal router weight during model loading. A
-            # forward-time Cast cannot be captured by ACLGraph on 310P.
-            self.gate.precast_fp32_weight = True
-
         ascend_shared_experts = getattr(self, "ascend_shared_experts", None)
         if ascend_shared_experts is not None:
             ascend_shared_experts.multistream_overlap = False
         _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl310(self.moe_config)
+
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Run the gate through its original linear layer so Qwen MoE keeps the
+        # model dtype and ACLGraph does not capture a forward-time FP32 cast.
+        with self._sequence_parallel_context():
+            if self.ascend_shared_experts is None:
+                if self.is_internal_router:
+                    gate = self.gate
+                    assert gate is not None
+                    router_logits, _ = gate(hidden_states)
+                return self.routed_experts.forward_impl(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
+
+            if self.is_internal_router:
+                gate = self.gate
+                assert gate is not None
+                before_routed_experts = torch.npu.current_stream().record_event()
+                router_logits, _ = gate(hidden_states)
+                after_routed_experts = torch.npu.current_stream().record_event()
+            else:
+                before_routed_experts = torch.npu.current_stream().record_event()
+                after_routed_experts = None
+
+            routed_out, fused_moe_events = self.routed_experts.forward_impl(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                input_ids=input_ids,
+            )
+            fused_moe_events.before_routed_experts = before_routed_experts
+            fused_moe_events.after_routed_experts = after_routed_experts
+
+            shared_out = self.ascend_shared_experts.forward(
+                hidden_states,
+                fused_moe_events,
+            )
+            return shared_out, routed_out
