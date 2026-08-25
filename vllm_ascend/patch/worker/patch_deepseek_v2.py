@@ -32,6 +32,64 @@ from vllm.model_executor.models.deepseek_v2 import (
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.sequence import IntermediateTensors
 
+_PP_TOPK_INDICES_KEY = "topk_indices"
+
+
+def _should_reuse_topk(
+    config: DeepseekV2Config | DeepseekV3Config,
+    layer_id: int,
+) -> bool:
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is None:
+        index_topk_freq = getattr(config, "index_topk_freq", 1)
+        index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
+        return max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
+    return 0 <= layer_id < len(index_topk_pattern) and index_topk_pattern[layer_id] == "S"
+
+
+def _pp_stage_needs_topk_indices(
+    config: DeepseekV2Config | DeepseekV3Config,
+    start_layer: int,
+) -> bool:
+    """Return whether a PP stage needs Top-K indices from its predecessor."""
+    num_hidden_layers = getattr(config, "num_hidden_layers", 0)
+    if start_layer <= 0 or start_layer >= num_hidden_layers:
+        return False
+
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        for layer_id in range(start_layer, min(len(indexer_types), num_hidden_layers)):
+            indexer_type = indexer_types[layer_id]
+            if not isinstance(indexer_type, str):
+                continue
+            indexer_type = indexer_type.lower()
+            if indexer_type == "full":
+                return False
+            if indexer_type == "shared":
+                return True
+
+    return bool(getattr(config, "use_index_cache", False)) and _should_reuse_topk(config, start_layer)
+
+
+def _copy_pp_topk_indices(
+    topk_indices_buffer: torch.Tensor,
+    intermediate_tensors: IntermediateTensors,
+) -> None:
+    received_topk_indices = intermediate_tensors[_PP_TOPK_INDICES_KEY]
+    if received_topk_indices.shape[1:] != topk_indices_buffer.shape[1:]:
+        raise ValueError(
+            "Received PP Top-K indices have an unexpected shape: "
+            f"received {tuple(received_topk_indices.shape)}, "
+            f"buffer {tuple(topk_indices_buffer.shape)}."
+        )
+    num_tokens = received_topk_indices.shape[0]
+    if num_tokens > topk_indices_buffer.shape[0]:
+        raise ValueError(
+            "Received PP Top-K indices exceed the local buffer capacity: "
+            f"received {num_tokens} tokens, capacity {topk_indices_buffer.shape[0]}."
+        )
+    topk_indices_buffer[:num_tokens].copy_(received_topk_indices)
+
 
 def _should_skip_indexer_init(
     config: DeepseekV2Config | DeepseekV3Config,
@@ -196,35 +254,8 @@ def _deepseek_v2_mla_attention_init(
     # skip_topk controls top-k reuse. Indexer initialization is skipped only
     # when the checkpoint marks this layer as sharing another layer's Indexer.
     _skip_topk = False
-    _index_topk_freq = getattr(
-        config,
-        "index_topk_freq",
-        1,
-    )
-    _index_topk_pattern = getattr(
-        config,
-        "index_topk_pattern",
-        None,
-    )
-    _index_skip_topk_offset = getattr(
-        config,
-        "index_skip_topk_offset",
-        2,
-    )
-
     layer_id = extract_layer_index(prefix)
-
-    if _index_topk_pattern is None:
-        _skip_topk = (
-            max(
-                layer_id - _index_skip_topk_offset + 1,
-                0,
-            )
-            % _index_topk_freq
-            != 0
-        )
-    elif 0 <= layer_id < len(_index_topk_pattern):
-        _skip_topk = _index_topk_pattern[layer_id] == "S"
+    _skip_topk = _should_reuse_topk(config, layer_id)
 
     skip_indexer_init = _should_skip_indexer_init(config, prefix, _skip_topk)
     if self.is_v32 and not skip_indexer_init:
@@ -253,6 +284,8 @@ def _deepseek_v2_mla_attention_init(
     else:
         self.indexer_rope_emb = None
         self.indexer = None
+
+    self.topk_indices_buffer = topk_indices_buffer
 
     mla_modules = MLAModules(
         kv_a_layernorm=self.kv_a_layernorm,
@@ -290,6 +323,73 @@ def _deepseek_v2_mla_attention_init(
 DeepseekV2MLAAttention.__init__ = _deepseek_v2_mla_attention_init
 
 
+_original_deepseek_v2_model_init = DeepseekV2Model.__init__
+
+
+def _deepseek_v2_model_init_with_pp_topk_propagation(
+    self,
+    *,
+    vllm_config: VllmConfig,
+    prefix: str = "",
+) -> None:
+    _original_deepseek_v2_model_init(
+        self,
+        vllm_config=vllm_config,
+        prefix=prefix,
+    )
+
+    self.topk_indices_buffer = None
+    for layer in self.layers:
+        self_attn = getattr(layer, "self_attn", None)
+        topk_indices_buffer = getattr(self_attn, "topk_indices_buffer", None)
+        if topk_indices_buffer is not None:
+            self.topk_indices_buffer = topk_indices_buffer
+            break
+
+    if self.topk_indices_buffer is None:
+        self.receive_pp_topk_indices = False
+        self.send_pp_topk_indices = False
+        return
+
+    self.receive_pp_topk_indices = _pp_stage_needs_topk_indices(
+        self.config,
+        self.start_layer,
+    )
+    self.send_pp_topk_indices = _pp_stage_needs_topk_indices(
+        self.config,
+        self.end_layer,
+    )
+
+    if not self.receive_pp_topk_indices:
+        return
+
+    original_make_empty_intermediate_tensors = self.make_empty_intermediate_tensors
+    topk_tokens = self.topk_indices_buffer.shape[1]
+    topk_dtype = self.topk_indices_buffer.dtype
+
+    def make_empty_intermediate_tensors(
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        intermediate_tensors = original_make_empty_intermediate_tensors(
+            batch_size,
+            dtype,
+            device,
+        )
+        intermediate_tensors.tensors[_PP_TOPK_INDICES_KEY] = torch.zeros(
+            (batch_size, topk_tokens),
+            dtype=topk_dtype,
+            device=device,
+        )
+        return intermediate_tensors
+
+    self.make_empty_intermediate_tensors = make_empty_intermediate_tensors
+
+
+DeepseekV2Model.__init__ = _deepseek_v2_model_init_with_pp_topk_propagation
+
+
 def _patched_forward(
     self,
     input_ids: torch.Tensor | None,
@@ -309,6 +409,12 @@ def _patched_forward(
         assert intermediate_tensors is not None
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
+        if self.receive_pp_topk_indices:
+            assert self.topk_indices_buffer is not None
+            _copy_pp_topk_indices(
+                self.topk_indices_buffer,
+                intermediate_tensors,
+            )
 
     llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
     llama_4_scaling: torch.Tensor | None
@@ -335,7 +441,18 @@ def _patched_forward(
         hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
     if not get_pp_group().is_last_rank:
-        return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
+        tensors = {"hidden_states": hidden_states, "residual": residual}
+        if self.send_pp_topk_indices:
+            assert self.topk_indices_buffer is not None
+            num_tokens = positions.shape[-1]
+            if num_tokens > self.topk_indices_buffer.shape[0]:
+                raise ValueError(
+                    "PP Top-K indices exceed the local buffer capacity: "
+                    f"requested {num_tokens} tokens, capacity "
+                    f"{self.topk_indices_buffer.shape[0]}."
+                )
+            tensors[_PP_TOPK_INDICES_KEY] = self.topk_indices_buffer[:num_tokens]
+        return IntermediateTensors(tensors)
 
     if hidden_states.shape[0] != positions.shape[0]:
         combined_states = torch.cat([hidden_states, residual], dim=-1)
