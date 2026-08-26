@@ -444,6 +444,7 @@ class NPUModelRunner310V2(NPUModelRunner):
             cache_groups: dict[tuple[Any, ...], list[str]] = {}
             for layer_name in layer_names:
                 kv_cache_spec = layer_specs[layer_name]
+                cache_key: tuple[Any, ...]
                 if isinstance(kv_cache_spec, AttentionSpec):
                     backend = layer_backends[layer_name]
                     group_id = layer_group_ids[layer_name]
@@ -468,7 +469,8 @@ class NPUModelRunner310V2(NPUModelRunner):
                     raise ValueError("KV cache allocation contains fewer blocks than requested.")
 
                 if isinstance(kv_cache_spec, AttentionSpec):
-                    _, backend, kernel_block_size = cache_key
+                    backend = cache_key[1]
+                    kernel_block_size = cache_key[2]
                     if not issubclass(backend, AscendAttentionBackend310):
                         raise TypeError(f"310P selected unexpected attention backend {backend}.")
                     blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size

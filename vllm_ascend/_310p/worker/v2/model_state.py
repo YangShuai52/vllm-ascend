@@ -23,7 +23,22 @@ from .sampler import Ascend310PSampler
 
 
 class _Ascend310PModelStateMixin:
-    """310P RoPE / FULL-graph seq_lens helpers shared by dense and hybrid."""
+    """310P RoPE / FULL-graph seq_lens helpers shared by dense and hybrid.
+
+    Attribute annotations below are provided at runtime by AscendModelState /
+    DefaultModelState (or set in the concrete subclass ``__init__``). Declared
+    here so mypy can type-check the mixin in isolation.
+    """
+
+    model_config: Any
+    model: nn.Module
+    max_num_reqs: int
+    max_num_tokens: int
+    max_model_len: int
+    device: torch.device
+    rope_state: Any
+    mm_pruner: Any
+    _capture_seq_lens_by_ptr: dict[int, torch.Tensor]
 
     def _replace_310p_rope_state(self, encoder_cache: EncoderCache | None) -> None:
         self.rope_state = get_310p_rope_state(
@@ -73,7 +88,8 @@ class _Ascend310PModelStateMixin:
             # bound to a different capture-time address.
             self._refresh_capture_seq_lens(input_batch.seq_lens)
 
-        return super().prepare_attn(
+        # Mixin sits before AscendModelState / AscendMambaHybridModelState in MRO.
+        return super().prepare_attn(  # type: ignore[misc]
             input_batch,
             cudagraph_mode,
             block_tables,
@@ -85,7 +101,7 @@ class _Ascend310PModelStateMixin:
 
     def prepare_inputs(self, input_batch: AscendInputBatch, req_states):
         if self.rope_state is None:
-            return super().prepare_inputs(input_batch, req_states)
+            return super().prepare_inputs(input_batch, req_states)  # type: ignore[misc]
 
         assert isinstance(self.rope_state, Ascend310PRopeState)
         # Upstream RopeState.prepare_positions uses Triton; 310P builds positions
@@ -120,10 +136,13 @@ class Ascend310PModelState(_Ascend310PModelStateMixin, AscendModelState):
         # Initialize the full Ascend/DefaultModelState contract first so
         # attributes such as ``prompt_embeds_state`` / ``encoder_runner`` exist,
         # then swap RoPE to the Triton-free 310P implementation.
-        AscendModelState.__init__(self, vllm_config, model, encoder_cache, device)
+        # follow-imports=skip hides DefaultModelState.__init__; ignore call-arg.
+        AscendModelState.__init__(  # type: ignore[call-arg]
+            self, vllm_config, model, encoder_cache, device
+        )
         # ACLGraph replays the tensor addresses bound during capture. Keep every
         # captured seq_lens buffer so its contents can be refreshed before replay.
-        self._capture_seq_lens_by_ptr: dict[int, torch.Tensor] = {}
+        self._capture_seq_lens_by_ptr = {}
         self._replace_310p_rope_state(encoder_cache)
 
 
@@ -139,8 +158,10 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
     ) -> None:
         # Initialize the complete upstream/Ascend hybrid contract first (e.g.
         # ``_align_mode`` / mamba metadata), then replace Triton RoPE.
-        AscendMambaHybridModelState.__init__(self, vllm_config, model, encoder_cache, device)
-        self._capture_seq_lens_by_ptr: dict[int, torch.Tensor] = {}
+        AscendMambaHybridModelState.__init__(  # type: ignore[call-arg]
+            self, vllm_config, model, encoder_cache, device
+        )
+        self._capture_seq_lens_by_ptr = {}
         self._replace_310p_rope_state(encoder_cache)
 
     def postprocess_state(
