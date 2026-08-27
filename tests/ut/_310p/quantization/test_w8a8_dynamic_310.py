@@ -109,37 +109,32 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
         mock_npu_quant_matmul.assert_called_once()
         (args, kwargs) = mock_npu_quant_matmul.call_args
 
-        # positional args
         self.assertTrue(torch.equal(args[0], expect_x_output))
         self.assertTrue(torch.equal(args[1], layer.weight.data))
         self.assertTrue(torch.equal(args[2], layer.weight_scale))
 
-        # kwargs
         self.assertTrue(torch.equal(kwargs["pertoken_scale"], expect_pertoken_scale_output))
         self.assertTrue(kwargs["bias"] is None)
-        self.assertEqual(kwargs["output_dtype"], layer.params_dtype)
+        self.assertEqual(kwargs["output_dtype"], x.dtype)
 
         self.assertTrue(torch.equal(output, expected_y_output))
 
     @patch("vllm_ascend.utils.is_310p", return_value=True)
     @patch("torch_npu.npu_format_cast")
     def test_process_weights_after_loading_calls_nz_format_cast_310p(self, mock_npu_format_cast, _mock_is_310p):
+        from types import SimpleNamespace
+
         mock_npu_format_cast.side_effect = lambda x, fmt: x
 
-        layer = MagicMock()
-
-        # Attributes used by process_weights_after_loading()
-        layer.weight = MagicMock()
-        layer.weight_scale = MagicMock()
-        layer.weight_offset = MagicMock()
-
-        layer.weight.data = torch.randint(-127, 128, (128, 256), dtype=torch.int8)
-
-        layer.weight_scale.data = torch.randn(128, 1, dtype=torch.bfloat16)
-        layer.weight_offset.data = torch.randn(128, 1, dtype=torch.bfloat16)
-        # w2_weight_offset is reshaped to (N, -1); any (N, 1) is fine
-        layer.w2_weight_offset.data = torch.randn(128, 1, dtype=torch.bfloat16)
+        layer = SimpleNamespace(
+            weight=SimpleNamespace(data=torch.randint(-127, 128, (128, 256), dtype=torch.int8)),
+            weight_scale=SimpleNamespace(data=torch.randn(128, 1, dtype=torch.bfloat16)),
+            weight_offset=SimpleNamespace(data=torch.randn(128, 1, dtype=torch.bfloat16)),
+        )
 
         self.method.process_weights_after_loading(layer)
 
         mock_npu_format_cast.assert_called_once()
+        self.assertEqual(layer.weight_scale.data.ndim, 1)
+        self.assertFalse(hasattr(layer, "weight_fp"))
+        self.assertEqual(layer.weight.data.shape, (256, 128))
