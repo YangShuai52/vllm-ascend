@@ -19,7 +19,6 @@ import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.quantization.methods.w8a8_dynamic import (
-    _MIN_NZ_QUANT_MATMUL_N,
     AscendW8A8DynamicFusedMoEMethod310,
     AscendW8A8DynamicLinearMethod310,
 )
@@ -88,47 +87,51 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
         self.assertEqual(params["weight_scale"].shape, (10, 1))
         self.assertEqual(params["weight_offset"].shape, (10, 1))
 
-    def test_apply_310(self):
+    @patch("torch_npu.npu_dynamic_quant", create=True)
+    @patch("torch_npu.npu_quant_matmul")
+    def test_apply_310(self, mock_npu_quant_matmul, mock_npu_dynamic_quantize):
         layer = MagicMock()
-        weight = torch.randint(-8, 8, (256, 128), dtype=torch.int8)
-        scale = torch.ones(256, dtype=torch.float32)
-        layer.weight_fp = (weight.to(torch.float16) * scale.view(-1, 1)).to(torch.float16)
-        x = torch.randn(32, 128, dtype=torch.float16)
-
-        output = self.method.apply(layer, x, tp_rank=0)
-
-        self.assertEqual(output.shape, (32, 256))
-        self.assertEqual(output.dtype, torch.float16)
-
-    def test_apply_fp16_fallback_skips_quant_matmul_310(self):
-        # Document the N=256 case that triggers QuantBatchMatmulV3_NZ_NZ kernel 21
-        # under GE when NZ weights are used (Qwen3.5-2B TP2 KV shard).
-        self.assertEqual(_MIN_NZ_QUANT_MATMUL_N, 512)
-        layer = MagicMock()
-        weight = torch.randint(-8, 8, (256, 2048), dtype=torch.int8)
-        scale = torch.ones(256, dtype=torch.float32)
-        layer.weight_fp = (weight.to(torch.float16) * scale.view(-1, 1)).to(torch.float16)
-        x = torch.randn(4, 2048, dtype=torch.float16)
-
-        output = self.method.apply(layer, x, tp_rank=0)
-
-        self.assertEqual(output.shape, (4, 256))
-        self.assertEqual(output.dtype, torch.float16)
-
-    def test_process_weights_keeps_nd_and_builds_weight_fp(self):
-        layer = MagicMock()
-        layer.weight = MagicMock()
-        layer.weight_scale = MagicMock()
-        layer.weight_offset = MagicMock()
+        layer.weight = torch.randint(-127, 128, (256, 128), dtype=torch.int8)
+        layer.weight_scale = torch.randn(256, dtype=torch.float32)
         layer.params_dtype = torch.float16
 
-        layer.weight.data = torch.randint(-8, 8, (256, 128), dtype=torch.int8)
-        layer.weight_scale.data = torch.ones(256, 1, dtype=torch.float32)
-        layer.weight_offset.data = torch.zeros(256, 1, dtype=torch.float32)
+        x = torch.randn(32, 128, dtype=torch.float16)
+        expect_x_output = torch.randint(-128, 127, x.shape, dtype=torch.int8)
+        expect_pertoken_scale_output = torch.randn(x.shape[0], dtype=torch.float32)
+        mock_npu_dynamic_quantize.return_value = expect_x_output, expect_pertoken_scale_output
+
+        expected_y_output = torch.randn(32, 256)
+        mock_npu_quant_matmul.return_value = expected_y_output
+
+        output = self.method.apply(layer, x, tp_rank=0)
+
+        mock_npu_dynamic_quantize.assert_called_with(x.contiguous())
+        mock_npu_quant_matmul.assert_called_once()
+        (args, kwargs) = mock_npu_quant_matmul.call_args
+
+        self.assertTrue(torch.equal(args[0], expect_x_output))
+        self.assertTrue(torch.equal(args[1], layer.weight.data))
+        self.assertTrue(torch.equal(args[2], layer.weight_scale))
+
+        self.assertTrue(torch.equal(kwargs["pertoken_scale"], expect_pertoken_scale_output))
+        self.assertTrue(kwargs["bias"] is None)
+        self.assertEqual(kwargs["output_dtype"], x.dtype)
+
+        self.assertTrue(torch.equal(output, expected_y_output))
+
+    @patch("vllm_ascend._310p.quantization.methods.w8a8_dynamic.maybe_trans_nz", side_effect=lambda x: x)
+    def test_process_weights_after_loading_uses_nz_kn_layout_310p(self, mock_trans_nz):
+        from types import SimpleNamespace
+
+        layer = SimpleNamespace(
+            weight=SimpleNamespace(data=torch.randint(-127, 128, (128, 256), dtype=torch.int8)),
+            weight_scale=SimpleNamespace(data=torch.randn(128, 1, dtype=torch.bfloat16)),
+            weight_offset=SimpleNamespace(data=torch.randn(128, 1, dtype=torch.bfloat16)),
+        )
 
         self.method.process_weights_after_loading(layer)
 
-        self.assertTrue(hasattr(layer, "weight_fp"))
-        self.assertEqual(layer.weight_fp.shape, (256, 128))
-        self.assertEqual(layer.weight_fp.dtype, torch.float16)
+        mock_trans_nz.assert_called_once()
         self.assertEqual(layer.weight_scale.data.ndim, 1)
+        self.assertFalse(hasattr(layer, "weight_fp"))
+        self.assertEqual(layer.weight.data.shape, (256, 128))

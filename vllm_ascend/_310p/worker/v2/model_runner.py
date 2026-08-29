@@ -35,7 +35,6 @@ from vllm.v1.worker.gpu.model_runner import sort_batch_req_ids
 from vllm.v1.worker.utils import bind_kv_cache
 
 from vllm_ascend._310p.attention.attention_v1 import AscendAttentionBackend310
-from vllm_ascend._310p.worker.v2.attn_utils import get_310p_non_mla_kv_cache_shapes
 from vllm_ascend._310p.worker.v2.block_table import Ascend310PBlockTables
 from vllm_ascend._310p.worker.v2.kv_block_zeroer import AscendKVBlockZeroer310V2
 from vllm_ascend._310p.worker.v2.states import Ascend310PRequestState
@@ -117,6 +116,11 @@ class NPUModelRunner310V2(NPUModelRunner):
     ) -> AscendInputBatch:
         # TODO: Refactor this Triton-free input preparation through Triton
         # Dispatcher after vLLM RFC #45133 lands.
+        # ``super().execute_model`` has already run finish/add/update_requests and
+        # ``apply_staged_writes``; sync GPU counts now so mamba preprocess matches
+        # the CPU/np values used for positions and slot mappings.
+        self._sync_num_computed_tokens_gpu_from_np()
+
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
         assert num_tokens > 0
@@ -262,8 +266,19 @@ class NPUModelRunner310V2(NPUModelRunner):
         if not vllm_version_is("0.27.1"):
             input_batch_kwargs["has_prefill"] = batch_has_prefill
         input_batch = AscendInputBatch(**input_batch_kwargs)
-        update_cos_sin(input_batch.positions)
+        # MRoPE positions are built in ``model_state.prepare_inputs``; the 1D
+        # arange buffer above is only for slot-mapping / non-MRoPE paths.
+        if not self.model_config.uses_mrope:
+            update_cos_sin(input_batch.positions)
         return input_batch
+
+    def _sync_num_computed_tokens_gpu_from_np(self) -> None:
+        """Mirror ``num_computed_tokens_np`` onto GPU before mamba preprocess."""
+        np_vals = self.req_states.num_computed_tokens_np
+        gpu = self.req_states.num_computed_tokens.gpu
+        gpu.copy_(torch.from_numpy(np_vals).to(device=gpu.device, dtype=gpu.dtype))
+        self.req_states.num_computed_tokens_cpu.copy_(torch.from_numpy(np_vals))
+        self.req_states.num_computed_tokens.cpu.copy_(torch.from_numpy(np_vals))
 
     if vllm_version_is("0.27.1"):
 
@@ -288,9 +303,10 @@ class NPUModelRunner310V2(NPUModelRunner):
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         super().finish_requests(scheduler_output)
         if scheduler_output.finished_req_ids:
-            # A freed request slot can be reused and its CPU-owned block table
-            # rewritten in this step. Drain the previous ACLGraph replay before
-            # the new layout is gathered and copied to attention metadata.
+            # Same barrier as 310P MRv1 ``_update_states``: ACLGraph may still
+            # be reading the previous block-table layout while finish_requests
+            # rewrites CPU NumPy tables for a reused slot. Upstream GPU/MRv2
+            # does not need this because it does not use that CPU gather path.
             torch.npu.current_stream().synchronize()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -483,15 +499,16 @@ class NPUModelRunner310V2(NPUModelRunner):
                     )
                     if getattr(kv_cache_spec, "head_size_v", kv_cache_spec.head_size) != kv_cache_spec.head_size:
                         raise NotImplementedError("310P MRV2 does not support asymmetric K/V head sizes.")
-                    k_shape, v_shape = get_310p_non_mla_kv_cache_shapes(kv_cache_shape, kv_cache_spec)
+                    # Symmetric NZ only: K/V share the 4D view ``kv_cache_shape[1:]``.
+                    kv_view_shape = kv_cache_shape[1:]
                     k_cache = torch_npu.empty_with_format(
-                        size=k_shape,
+                        size=kv_view_shape,
                         dtype=kv_cache_spec.dtype,
                         device=self.device,
                         acl_format=ACL_FORMAT_FRACTAL_NZ,
                     )
                     v_cache = torch_npu.empty_with_format(
-                        size=v_shape,
+                        size=kv_view_shape,
                         dtype=kv_cache_spec.dtype,
                         device=self.device,
                         acl_format=ACL_FORMAT_FRACTAL_NZ,

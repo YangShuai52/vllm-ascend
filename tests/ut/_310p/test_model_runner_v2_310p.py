@@ -103,6 +103,88 @@ def test_310p_hybrid_model_state_initializes_full_upstream_contract() -> None:
     assert isinstance(state._capture_seq_lens_by_ptr, dict)
 
 
+def test_init_model_state_routes_qwen35_hybrid_to_310p() -> None:
+    """Qwen3.5 is_hybrid must select Ascend310PMambaHybridModelState on 310P."""
+    from vllm_ascend.worker.v2.model_states import init_asecnd_model_state
+
+    vllm_config = SimpleNamespace(model_config=SimpleNamespace(is_hybrid=True))
+    model = MagicMock(spec=["forward"])  # no get_model_state_cls
+    encoder_cache = object()
+    device = torch.device("cpu")
+    expected = object()
+
+    with (
+        patch("vllm_ascend.worker.v2.model_states.is_310p", return_value=True),
+        patch(
+            "vllm_ascend._310p.worker.v2.model_state.Ascend310PMambaHybridModelState",
+            return_value=expected,
+        ) as hybrid_cls,
+    ):
+        state = init_asecnd_model_state(vllm_config, model, encoder_cache, device)
+
+    assert state is expected
+    hybrid_cls.assert_called_once_with(vllm_config, model, encoder_cache, device)
+
+
+def test_get_kv_cache_spec_restores_qwen35_linear_attn() -> None:
+    """Qwen3.5 GDN layers may be omitted by upstream V2; 310P restores them."""
+    runner = object.__new__(NPUModelRunner310V2)
+    runner.vllm_config = object()
+    restored = object()
+    linear_layer = SimpleNamespace(get_kv_cache_spec=lambda _cfg: restored)
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={
+            "model.layers.0.self_attn": object(),
+            "model.layers.1.linear_attn": linear_layer,
+            "model.layers.2.linear_attn": SimpleNamespace(get_kv_cache_spec=lambda _cfg: None),
+        }
+    )
+
+    with patch.object(
+        NPUModelRunner,
+        "get_kv_cache_spec",
+        return_value={"model.layers.0.self_attn": object()},
+    ):
+        specs = runner.get_kv_cache_spec()
+
+    assert "model.layers.1.linear_attn" in specs
+    assert specs["model.layers.1.linear_attn"] is restored
+    assert "model.layers.2.linear_attn" not in specs
+
+
+def test_kv_cache_allocation_qwen35_mamba_stays_nd() -> None:
+    """Qwen3.5 hybrid Mamba/GDN state must stay ND (not FRACTAL_NZ)."""
+
+    class FakeMambaSpec:
+        block_size = 1
+        page_size_bytes = 64
+        shapes = [(4, 8), (2, 4)]
+        dtypes = [torch.float16, torch.float16]
+
+    spec = FakeMambaSpec()
+    layer_name = "model.layers.1.linear_attn"
+    kv_cache_config = SimpleNamespace(
+        num_blocks=2,
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec, layer_names=[layer_name])],
+        kv_cache_tensors=[SimpleNamespace(size=128, shared_by=[layer_name])],
+    )
+    runner = object.__new__(NPUModelRunner310V2)
+    runner.device = torch.device("cpu")
+    runner.cache_config = SimpleNamespace(cache_dtype="auto")
+    runner.kernel_block_sizes = [1]
+    runner.attn_groups = [[SimpleNamespace(backend=object, layer_names=[layer_name])]]
+
+    with patch.object(model_runner_module, "MambaSpec", FakeMambaSpec):
+        caches = runner._allocate_kv_cache_tensors(kv_cache_config, {})
+
+    states = caches[layer_name]
+    assert isinstance(states, list)
+    assert len(states) == 2
+    assert states[0].shape == (2, 4, 8)
+    assert states[1].shape == (2, 2, 4)
+    assert states[0].dtype == torch.float16
+
+
 def test_runner_installs_310p_request_state() -> None:
     request_state = object()
 

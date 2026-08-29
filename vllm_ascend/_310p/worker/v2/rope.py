@@ -7,26 +7,24 @@ import numpy as np
 import torch
 import torch.nn as nn
 from vllm.config import ModelConfig
-from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsXDRoPE
+from vllm.model_executor.models.interfaces import SupportsMRoPE
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 
 from vllm_ascend._310p.worker.v2.states import Ascend310PStagedWriteTensor
 
 
 class Ascend310PRopeState:
-    """Triton-free multi-dimensional RoPE state for 310P."""
+    """Triton-free MRoPE state for 310P (Qwen3-VL / Qwen3.5)."""
 
     def __init__(
         self,
         num_dims: int,
-        has_delta: bool,
         max_num_reqs: int,
         max_num_tokens: int,
         max_model_len: int,
         device: torch.device,
     ) -> None:
         self.num_dims = num_dims
-        self.has_delta = has_delta
         self.max_model_len = max_model_len
         self.device = device
         self.prefill_positions = Ascend310PStagedWriteTensor(
@@ -46,13 +44,10 @@ class Ascend310PRopeState:
         prefill_token_ids: list[int],
         mm_features: list,
     ) -> None:
-        if self.has_delta:
-            mrope_model = cast(SupportsMRoPE, model)
-            prefill_positions, delta = mrope_model.get_mrope_input_positions(prefill_token_ids, mm_features)
-            self.prefill_delta.np[req_idx] = delta
-        else:
-            xdrope_model = cast(SupportsXDRoPE, model)
-            prefill_positions = xdrope_model.get_xdrope_input_positions(prefill_token_ids, mm_features)
+        mrope_model = cast(SupportsMRoPE, model)
+        # Qwen3-VL / Qwen3.5 return ``(Tensor[num_dims, seq], delta)``.
+        prefill_positions, delta = mrope_model.get_mrope_input_positions(prefill_token_ids, mm_features)
+        self.prefill_delta.np[req_idx] = delta
 
         for dim in range(self.num_dims):
             self.prefill_positions.stage_write(
@@ -63,8 +58,7 @@ class Ascend310PRopeState:
 
     def apply_staged_writes(self) -> None:
         self.prefill_positions.apply_write()
-        if self.has_delta:
-            self.prefill_delta.copy_to_uva()
+        self.prefill_delta.copy_to_uva()
 
     def prepare_positions_cpu(
         self,
@@ -88,7 +82,7 @@ class Ascend310PRopeState:
                 ]
                 self.positions_cpu[:, query_start:query_end].copy_(positions)
             else:
-                delta = int(self.prefill_delta.np[req_idx]) if self.has_delta else 0
+                delta = int(self.prefill_delta.np[req_idx])
                 decode_positions = torch.arange(
                     num_computed + delta,
                     num_computed + delta + query_len,
@@ -112,17 +106,8 @@ def get_310p_rope_state(
     max_model_len: int,
     device: torch.device,
 ) -> Ascend310PRopeState | None:
+    # 310P Qwen3-VL / Qwen3.5 use MRoPE only; XD-RoPE is out of scope.
     if model_config.uses_mrope:
         assert isinstance(model, SupportsMRoPE)
-        return Ascend310PRopeState(3, True, max_num_reqs, max_num_tokens, max_model_len, device)
-    if model_config.uses_xdrope_dim > 0:
-        assert isinstance(model, SupportsXDRoPE)
-        return Ascend310PRopeState(
-            model_config.uses_xdrope_dim,
-            False,
-            max_num_reqs,
-            max_num_tokens,
-            max_model_len,
-            device,
-        )
+        return Ascend310PRopeState(3, max_num_reqs, max_num_tokens, max_model_len, device)
     return None
