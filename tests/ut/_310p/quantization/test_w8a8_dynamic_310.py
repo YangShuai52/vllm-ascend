@@ -22,6 +22,8 @@ from vllm_ascend._310p.quantization.methods.w8a8_dynamic import (
     AscendW8A8DynamicFusedMoEMethod310,
     AscendW8A8DynamicLinearMethod310,
 )
+from vllm_ascend.device.hardware import AscendDeviceType
+from vllm_ascend.device.hardware_profile import get_hardware_profile
 
 
 class TestAscendW8A8FusedMoEMethod310(TestBase):
@@ -109,28 +111,35 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
         mock_npu_quant_matmul.assert_called_once()
         (args, kwargs) = mock_npu_quant_matmul.call_args
 
+        # positional args
         self.assertTrue(torch.equal(args[0], expect_x_output))
         self.assertTrue(torch.equal(args[1], layer.weight.data))
         self.assertTrue(torch.equal(args[2], layer.weight_scale))
 
+        # kwargs
         self.assertTrue(torch.equal(kwargs["pertoken_scale"], expect_pertoken_scale_output))
         self.assertTrue(kwargs["bias"] is None)
+        # 310P keeps x.dtype (see _310p/quantization/methods/w8a8_dynamic.py).
         self.assertEqual(kwargs["output_dtype"], x.dtype)
 
         self.assertTrue(torch.equal(output, expected_y_output))
 
-    @patch("vllm_ascend.utils.is_310p", return_value=True)
+    @patch("vllm_ascend.utils.get_current_hardware_profile", return_value=get_hardware_profile(AscendDeviceType._310P))
     @patch("torch_npu.npu_format_cast")
     def test_process_weights_after_loading_calls_nz_format_cast_310p(self, mock_npu_format_cast, _mock_is_310p):
-        from types import SimpleNamespace
-
         mock_npu_format_cast.side_effect = lambda x, fmt: x
 
-        layer = SimpleNamespace(
-            weight=SimpleNamespace(data=torch.randint(-127, 128, (128, 256), dtype=torch.int8)),
-            weight_scale=SimpleNamespace(data=torch.randn(128, 1, dtype=torch.bfloat16)),
-            weight_offset=SimpleNamespace(data=torch.randn(128, 1, dtype=torch.bfloat16)),
-        )
+        layer = MagicMock()
+
+        # Attributes used by process_weights_after_loading()
+        layer.weight = MagicMock()
+        layer.weight_scale = MagicMock()
+        layer.weight_offset = MagicMock()
+
+        layer.weight.data = torch.randint(-127, 128, (128, 256), dtype=torch.int8)
+
+        layer.weight_scale.data = torch.randn(128, 1, dtype=torch.bfloat16)
+        layer.weight_offset.data = torch.randn(128, 1, dtype=torch.bfloat16)
 
         self.method.process_weights_after_loading(layer)
 
