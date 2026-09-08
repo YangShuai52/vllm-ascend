@@ -118,8 +118,7 @@ class _Ascend310PModelStateMixin:
         return {"positions": positions}
 
     def custom_sampler(self, sampler):
-        del sampler
-        return Ascend310PSampler(), None
+        return Ascend310PSampler(sampler), None
 
 
 class Ascend310PModelState(_Ascend310PModelStateMixin, AscendModelState):

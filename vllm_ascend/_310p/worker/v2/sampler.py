@@ -14,7 +14,16 @@ class Ascend310PSampler:
     # TODO: Refactor this sampler to register 310P implementations through
     # Triton Dispatcher after vLLM RFC #45133 lands.
 
-    def __init__(self) -> None:
+    def __init__(self, upstream_sampler=None) -> None:
+        self.penalties_state = SimpleNamespace(output_bin_counts=None)
+        # Reuse upstream sampling_states for speculator compatibility.
+        self._upstream = upstream_sampler
+        self.sampling_states = getattr(upstream_sampler, 'sampling_states', None)
+        if self.sampling_states is None:
+            self.sampling_states = SimpleNamespace(
+                temperature=SimpleNamespace(gpu=torch.zeros(1, dtype=torch.float32)),
+                seeds=SimpleNamespace(gpu=torch.zeros(1, dtype=torch.int64)),
+            )
         self.penalties_state = SimpleNamespace(output_bin_counts=None)
 
     def add_request(
@@ -23,7 +32,8 @@ class Ascend310PSampler:
         prompt_len: int,
         sampling_params: SamplingParams,
     ) -> None:
-        del req_idx, prompt_len
+        if self._upstream is not None:
+            self._upstream.add_request(req_idx, prompt_len, sampling_params)
         unsupported = []
         if sampling_params.temperature != 0:
             unsupported.append("temperature")
@@ -52,7 +62,8 @@ class Ascend310PSampler:
             )
 
     def apply_staged_writes(self) -> None:
-        pass
+        if self._upstream is not None:
+            self._upstream.apply_staged_writes()
 
     def __call__(self, logits: torch.Tensor, input_batch) -> SamplerOutput:
         sampled = logits.argmax(dim=-1).to(torch.int32)

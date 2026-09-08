@@ -62,6 +62,13 @@ class NPUModelRunner310V2(NPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self._validate_config(vllm_config)
         super().__init__(vllm_config, device)
+        # Replace the speculator created by the parent with a 310P-specific
+        # one that provides Triton-free CPU fallbacks and handles eager mode.
+        if self.speculator is not None:
+            from vllm_ascend._310p.worker.v2.spec_decode import init_310p_speculator
+
+            self.speculator = init_310p_speculator(self.vllm_config, self.device)
+            self.speculator.update_stream = self.update_stream
         self.req_states = Ascend310PRequestState(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -105,7 +112,8 @@ class NPUModelRunner310V2(NPUModelRunner):
         if getattr(parallel_config, "enable_expert_parallel", False):
             raise NotImplementedError("Expert parallelism is not supported by model runner v2 on 310P.")
         # TODO: Support speculative decoding in the next 310P MRV2 iteration.
-        if vllm_config.speculative_config is not None:
+        # Enabled for MTP eager mode testing.
+        if vllm_config.speculative_config is not None and False:  # disabled for MTP eager
             raise NotImplementedError("Speculative decoding is not supported by model runner v2 on 310P.")
         if vllm_config.kv_transfer_config is not None:
             raise NotImplementedError("KV cache transfer is not supported by model runner v2 on 310P.")
@@ -207,8 +215,40 @@ class NPUModelRunner310V2(NPUModelRunner):
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
         self.input_buffers.seq_lens_np[num_reqs_padded:] = 0
-        cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
-        cu_num_logits = torch.arange(num_reqs + 1, device=self.device, dtype=torch.int32)
+        # Handle draft tokens for speculative decoding (MTP).
+        draft_tokens = scheduler_output.scheduled_spec_decode_tokens
+        num_draft_tokens_per_req = None
+        if not draft_tokens:
+            total_num_draft_tokens = 0
+            total_num_logits = num_reqs
+            cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
+            cu_num_logits = torch.arange(num_reqs + 1, device=self.device, dtype=torch.int32)
+            expanded_idx_mapping = idx_mapping
+            expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
+        else:
+            num_draft_tokens_per_req = np.fromiter(
+                (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
+                dtype=np.int32,
+                count=num_reqs,
+            )
+            num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
+            total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
+            total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
+            num_logits_per_req = num_draft_tokens_per_req + num_bonus_tokens
+            cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+            cu_num_logits_np[0] = 0
+            np.cumsum(num_logits_per_req, out=cu_num_logits_np[1:])
+            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+            # CPU fallback for expand_idx_mapping (no Triton on 310P).
+            expanded_idx_mapping_np = np.empty(total_num_logits, dtype=np.int32)
+            expanded_local_pos_np = np.empty(total_num_logits, dtype=np.int32)
+            for batch_idx in range(num_reqs):
+                start = int(cu_num_logits_np[batch_idx])
+                end = int(cu_num_logits_np[batch_idx + 1])
+                expanded_idx_mapping_np[start:end] = idx_mapping_np[batch_idx]
+                expanded_local_pos_np[start:end] = np.arange(end - start, dtype=np.int32)
+            expanded_idx_mapping = async_copy_to_gpu(expanded_idx_mapping_np, device=self.device)
+            expanded_local_pos = async_copy_to_gpu(expanded_local_pos_np, device=self.device)
         logits_indices = self._combine_sampled_and_draft_tokens(
             self.input_buffers.input_ids,
             idx_mapping,
@@ -218,7 +258,7 @@ class NPUModelRunner310V2(NPUModelRunner):
             self.req_states.prefill_len.gpu,
             self.req_states.draft_tokens,
             cu_num_logits,
-            num_reqs,
+            total_num_logits,
             self.model_state.num_new_sampled_tokens_per_step,
             idx_mapping_np=idx_mapping_np,
             query_start_loc_np=query_start_loc_np,
@@ -238,13 +278,13 @@ class NPUModelRunner310V2(NPUModelRunner):
             num_reqs_after_padding=num_reqs_padded,
             idx_mapping=idx_mapping,
             idx_mapping_np=idx_mapping_np,
-            expanded_idx_mapping=idx_mapping,
-            expanded_local_pos=torch.zeros(num_reqs, dtype=torch.int32, device=self.device),
+            expanded_idx_mapping=expanded_idx_mapping,
+            expanded_local_pos=expanded_local_pos,
             num_scheduled_tokens=num_scheduled_tokens,
             num_tokens=num_tokens,
             num_tokens_after_padding=num_tokens_after_padding,
-            num_draft_tokens=0,
-            num_draft_tokens_per_req=None,
+            num_draft_tokens=total_num_draft_tokens,
+            num_draft_tokens_per_req=num_draft_tokens_per_req,
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
@@ -774,16 +814,34 @@ class NPUModelRunner310V2(NPUModelRunner):
         # TODO: Refactor this CPU fallback to use Triton Dispatcher after vLLM
         # RFC #45133 lands.
         del idx_mapping, query_start_loc, seq_lens, prefill_len
-        del draft_tokens, cu_num_logits, num_bonus_tokens
-        if num_logits != len(idx_mapping_np):
-            # TODO: Support draft tokens in the next 310P MRV2 iteration.
-            raise NotImplementedError("310P MRV2 does not support draft tokens.")
+        num_reqs = len(idx_mapping_np)
         logits_indices_np = np.empty(num_logits, dtype=np.int64)
-        for batch_idx, req_idx in enumerate(idx_mapping_np):
-            query_end = int(query_start_loc_np[batch_idx + 1])
-            logits_indices_np[batch_idx] = query_end - 1
-            if seq_lens_np[batch_idx] > prefill_len_np[batch_idx]:
-                input_ids[query_end - 1 : query_end].copy_(last_sampled_tokens[req_idx])
+        if num_logits == num_reqs:
+            # No draft tokens (normal decoding).
+            del draft_tokens, cu_num_logits, num_bonus_tokens
+            for batch_idx, req_idx in enumerate(idx_mapping_np):
+                query_end = int(query_start_loc_np[batch_idx + 1])
+                logits_indices_np[batch_idx] = query_end - 1
+                if seq_lens_np[batch_idx] > prefill_len_np[batch_idx]:
+                    input_ids[query_end - 1 : query_end].copy_(last_sampled_tokens[req_idx:req_idx+1, 0:1].reshape(-1))
+        else:
+            # With draft tokens (speculative decoding).
+            cu_num_logits_np = cu_num_logits.cpu().numpy()
+            for batch_idx, req_idx in enumerate(idx_mapping_np):
+                logits_start_idx = int(cu_num_logits_np[batch_idx])
+                logits_end_idx = int(cu_num_logits_np[batch_idx + 1])
+                num_l = logits_end_idx - logits_start_idx
+                num_draft = num_l - num_bonus_tokens
+                query_end = int(query_start_loc_np[batch_idx + 1])
+                logits_start_pos = query_end - num_l
+                for i in range(num_l):
+                    logits_indices_np[logits_start_idx + i] = logits_start_pos + i
+                if seq_lens_np[batch_idx] > prefill_len_np[batch_idx]:
+                    if num_bonus_tokens > 0:
+                        input_ids[logits_start_pos:logits_start_pos+1].copy_(last_sampled_tokens[req_idx:req_idx+1, 0:1].reshape(-1))
+                    if num_draft > 0 and draft_tokens is not None:
+                        for i in range(num_draft):
+                            input_ids[query_end - num_draft + i:query_end - num_draft + i + 1].copy_(draft_tokens[req_idx, i].reshape(1))
         return async_copy_to_gpu(logits_indices_np, device=self.device)
 
     def prepare_attn(
