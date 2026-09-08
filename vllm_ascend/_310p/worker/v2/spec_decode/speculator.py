@@ -214,19 +214,24 @@ if not HAS_TRITON:
 class Ascend310PAutoRegressiveSpeculator(AscendAutoRegressiveSpeculator):
     """310P-specific speculator base.
 
-    310P differs from standard Ascend (A2/A3) in two ways that affect the
+    310P differs from standard Ascend (A2/A3) in ways that affect the
     speculator:
 
     1. W8A8 checkpoints store quantization metadata outside config.json,
        so draft_model_config.hf_overrides may not be a dict. Upstream
        get_quant_config() raises ValueError in that case.
-    2. enforce_eager=True means no cudagraph_manager is created, so
+    2. In eager mode, no cudagraph_manager is created, so
        dispatch_cg_and_sync_dp() must take the need_eager=True path.
+    3. In FULL_DECODE_ONLY mode, prefill_cudagraph_manager is None
+       because only decode graphs are captured; the upstream capture()
+       and propose() must skip prefill-related assertions.
 
     Overrides:
     - _create_draft_vllm_config: ensure hf_overrides is a dict.
-    - propose: force is_profile=True when enforce_eager to trigger the
-      eager dispatch path and bypass the cudagraph_manager assertion.
+    - propose: force is_profile=True when prefill_cudagraph_manager is
+      None to trigger the eager dispatch path.
+    - capture: skip prefill graph capture when prefill_cudagraph_manager
+      is None.
     """
 
     def _create_draft_vllm_config(self) -> VllmConfig:
@@ -264,16 +269,88 @@ class Ascend310PAutoRegressiveSpeculator(AscendAutoRegressiveSpeculator):
         is_profile=None,
         dp_sync=None,
     ):
-        """Override propose to force eager dispatch when enforce_eager.
+        """Override propose to force eager dispatch when no prefill graph manager.
 
-        310P eager mode has no cudagraph_manager, so dispatch_cg_and_sync_dp
-        must take the need_eager=True path. We set is_profile=True to trigger
-        this in the upstream propose.
+        When prefill_cudagraph_manager is None (eager mode or FULL_DECODE_ONLY
+        without prefill capture), dispatch_cg_and_sync_dp must take the
+        need_eager=True path. We set is_profile=True to trigger this in the
+        upstream propose.
         """
         self.input_batch = input_batch
         sync_state = dp_sync
-        if self.speculative_config.enforce_eager:
+        if self.prefill_cudagraph_manager is None:
             is_profile = True
+
+        from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310
+        from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
+        from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import (
+            torch_gather_wrapper,
+        )
+        from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
+            disable_target_pcp_for_replicated_draft,
+        )
+
+        # 310P: preprocess Mamba/GDN recurrent state before draft forward.
+        # Without this, the draft model's hybrid recurrent state is stale,
+        # causing draft predictions to diverge after a few steps.
+        try:
+            _ms = self.model_state
+            if _ms is not None and self.input_batch is not None:
+                _ms.preprocess_state(
+                    self.input_batch,
+                    self.block_tables,
+                    self.kv_cache_config,
+                    self.input_batch.num_computed_tokens_gpu
+                    if hasattr(self.input_batch, 'num_computed_tokens_gpu')
+                    else _ms.num_computed_tokens.gpu,
+                )
+        except Exception:
+            pass
+
+        AscendRotaryEmbedding310.set_rope_position_flag_310p(True)
+        try:
+            with (
+                disable_target_pcp_for_replicated_draft(self),
+                build_attn_metadata_wrapper(),
+                torch_gather_wrapper(),
+            ):
+                result = super().propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings,
+                    last_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    sync_state,
+                    dummy_run,
+                    skip_attn_for_dummy_run,
+                    mm_inputs,
+                    is_profile=is_profile,
+                )
+            # 310P: postprocess Mamba/GDN recurrent state after draft forward.
+            try:
+                _ms = self.model_state
+                if _ms is not None:
+                    num_reqs = input_batch.num_reqs
+                    idx_mapping = input_batch.idx_mapping[:num_reqs]
+                    _ms.postprocess_state(idx_mapping, 1)
+            except Exception:
+                pass
+            return result
+        finally:
+            AscendRotaryEmbedding310.set_rope_position_flag_310p(False)
+
+    def capture(self) -> None:
+        """Override capture to skip prefill graph when prefill_cudagraph_manager
+        is None (eager mode or FULL_DECODE_ONLY without prefill capture).
+        """
+        logger.info("Capturing model for speculator...")
+        self.last_token_indices.zero_()
 
         from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
         from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import (
@@ -283,28 +360,36 @@ class Ascend310PAutoRegressiveSpeculator(AscendAutoRegressiveSpeculator):
             disable_target_pcp_for_replicated_draft,
         )
 
+        if self.prefill_cudagraph_manager is not None:
+            if self.prefill_cudagraph_manager.use_breakable_cg:
+                self.prefill_cudagraph_manager.init_breakable_cg_runner(self.model)
+            with disable_target_pcp_for_replicated_draft(self):
+                self.prefill_cudagraph_manager.capture(
+                    self._prefill,
+                    self.model_state,
+                    self.target_input_buffers,
+                    self.block_tables,
+                    self.draft_prefill_attn_groups,
+                    self.kv_cache_config,
+                    progress_bar_desc="Capturing prefill CUDA graphs",
+                )
+
+        if self.num_speculative_steps == 1:
+            return
+
+        assert self.decode_cudagraph_manager is not None
         with (
             disable_target_pcp_for_replicated_draft(self),
             build_attn_metadata_wrapper(),
-            torch_gather_wrapper(),
         ):
-            return super().propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings,
-                last_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                last_sampled,
-                next_prefill_tokens,
-                temperature,
-                seeds,
-                sync_state,
-                dummy_run,
-                skip_attn_for_dummy_run,
-                mm_inputs,
-                is_profile=is_profile,
+            self.decode_cudagraph_manager.capture(
+                self._multi_step_decode,
+                self.model_state,
+                self.input_buffers,
+                self.block_tables,
+                self.attn_groups,
+                self.kv_cache_config,
+                progress_bar_desc="Capturing decode CUDA graphs",
             )
 
 

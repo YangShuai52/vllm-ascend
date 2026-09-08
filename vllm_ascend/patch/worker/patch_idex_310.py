@@ -1,3 +1,4 @@
+import torch
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.third_party.flash_linear_attention.ops import index as fla_index
 
@@ -23,6 +24,69 @@ AscendSpecDecodeBaseProposer.set_inputs_first_pass = (  # type: ignore[method-as
 AscendSpecDecodeBaseProposer._run_merged_draft = (  # type: ignore[method-assign]
     AscendSpecDecodeBaseProposer310._run_merged_draft
 )
+
+# 310P: Apply the same Qwen3.5 MTP forward patch as the standard worker path
+# (patch_qwen3_5.py). 310P does not have STANDARD_WORKER_PATCHES, so the
+# patch is not loaded by the default __init__. Without this, the MTP draft
+# model uses the upstream forward which does not combine token embeddings
+# with target hidden states, causing 0% draft acceptance.
+try:
+    from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MultiTokenPredictor
+    from vllm.sequence import IntermediateTensors
+    from vllm.distributed import tensor_model_parallel_all_gather
+    from vllm.distributed.parallel_state import get_pp_group
+
+    def qwen3_5_mtp_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        hidden_states = self.fc(hidden_states)
+        residual = None
+
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[current_step_idx]
+        if mtp_layer.use_attn_reduce_scatter_for_moe:
+            from vllm.model_executor.models.utils import sequence_parallel_chunk
+
+            assert hidden_states.shape[0] == positions.shape[-1]
+            hidden_states = sequence_parallel_chunk(hidden_states)
+            assert residual is None
+        hidden_states, residual = mtp_layer(
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=residual,
+        )
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+        if mtp_layer.use_attn_reduce_scatter_for_moe:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+            hidden_states = hidden_states[: positions.shape[-1]]
+        return hidden_states
+
+    Qwen3_5MultiTokenPredictor.forward = qwen3_5_mtp_forward
+    import logging
+except ImportError as e:
+    import logging
+    logging.getLogger(__name__).warning(f"310P: MTP forward NOT patched: {e}")
 
 # Patch _warmup_prefill_kernels to no-op on 310P: triton.next_power_of_2 does
 # not exist in the triton version used on 310P CI, and NPU does not use these

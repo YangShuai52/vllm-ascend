@@ -32,6 +32,7 @@ from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.kv_connector import get_kv_connector
 from vllm.v1.worker.gpu.model_runner import BatchReqState, sort_batch_req_ids
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.utils import bind_kv_cache
 
 from vllm_ascend._310p.attention.attention_v1 import AscendAttentionBackend310
@@ -61,14 +62,27 @@ class NPUModelRunner310V2(NPUModelRunner):
     # implementations through Triton Dispatcher after vLLM RFC #45133 lands.
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self._validate_config(vllm_config)
-        super().__init__(vllm_config, device)
-        # Replace the speculator created by the parent with a 310P-specific
-        # one that provides Triton-free CPU fallbacks and handles eager mode.
+        # Patch the parent module's init_speculator so the speculator is
+        # created as the 310P variant directly. Creating the standard
+        # AscendMTPSpeculator first would fail on W8A8 checkpoints whose
+        # hf_overrides is not a dict (see _create_draft_vllm_config).
+        from vllm_ascend._310p.worker.v2.spec_decode import init_310p_speculator
+        import vllm_ascend.worker.v2.model_runner as _parent_mr
+        _orig_init_speculator = _parent_mr.init_speculator
+        _parent_mr.init_speculator = init_310p_speculator
+        try:
+            super().__init__(vllm_config, device)
+        finally:
+            _parent_mr.init_speculator = _orig_init_speculator
         if self.speculator is not None:
-            from vllm_ascend._310p.worker.v2.spec_decode import init_310p_speculator
-
-            self.speculator = init_310p_speculator(self.vllm_config, self.device)
             self.speculator.update_stream = self.update_stream
+        # Replace the draft tokens handler with a 310P-specific one
+        # that uses sync copy instead of CUDA Stream/Event.
+        from vllm_ascend._310p.worker.v2.draft_tokens_handler import (
+            Ascend310PDraftTokensHandler,
+        )
+
+        self.draft_tokens_handler = Ascend310PDraftTokensHandler(self.device)
         self.req_states = Ascend310PRequestState(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -882,15 +896,84 @@ class NPUModelRunner310V2(NPUModelRunner):
         # TODO: Refactor 310P sampling to use Triton Dispatcher after vLLM RFC
         # #45133 lands.
         if grammar_output is not None:
-            # TODO: Restore MRV1 structured output support in the next 310P MRV2 iteration.
             raise NotImplementedError("Structured output is not supported by model runner v2 on 310P.")
         logits = self.model.compute_logits(hidden_states[input_batch.logits_indices])
-        sampler_output = self.sampler(logits, input_batch)
-        can_sample_np = input_batch.seq_lens_np[: input_batch.num_reqs] >= input_batch.prefill_len_np
-        num_sampled = async_copy_to_gpu(can_sample_np.astype(np.int32), device=self.device)
-        num_rejected = torch.zeros_like(num_sampled)
-        sampler_output.num_sampled = num_sampled
-        sampler_output.num_rejected = num_rejected
+
+        num_reqs = input_batch.num_reqs
+        num_draft_tokens = getattr(input_batch, 'num_draft_tokens', 0)
+
+        if num_draft_tokens > 0 and hasattr(input_batch, 'cu_num_logits_np'):
+            # Spec decode: greedy rejection sampling (no Triton).
+            # The draft tokens being verified were written into input_ids by
+            # _combine_sampled_and_draft_tokens. Verify by comparing the
+            # target's argmax at each draft position with the draft token.
+            target_argmax = logits.argmax(dim=-1).to(torch.int32)
+            cu_num_logits_np = input_batch.cu_num_logits_np[:num_reqs + 1]
+            logits_indices = input_batch.logits_indices
+            input_ids = input_batch.input_ids
+
+            result_tokens = []
+            for req_idx in range(num_reqs):
+                start = int(cu_num_logits_np[req_idx])
+                end = int(cu_num_logits_np[req_idx + 1])
+                num_l = end - start
+                num_bonus = 1
+                num_draft = num_l - num_bonus
+
+                # Bonus token: target's own next-token prediction.
+                tokens = [target_argmax[start].item()]
+                num_accepted = 0
+                for i in range(num_draft):
+                    # The draft token sits at the logits position in input_ids.
+                    pos = int(logits_indices[start + num_bonus + i].item())
+                    draft_tok = int(input_ids[pos].item())
+                    target_tok = target_argmax[start + num_bonus + i].item()
+                    if draft_tok == target_tok:
+                        tokens.append(target_tok)
+                        num_accepted += 1
+                    else:
+                        # Rejected: take the target's correction token instead.
+                        tokens.append(target_tok)
+                        break
+                result_tokens.append(tokens)
+
+            max_len = max(len(t) for t in result_tokens)
+            sampled_ids = torch.zeros((num_reqs, max_len), dtype=torch.int32, device=self.device)
+            num_sampled_list = []
+            num_rejected_list = []
+            for i, tokens in enumerate(result_tokens):
+                sampled_ids[i, :len(tokens)] = torch.tensor(tokens, dtype=torch.int32, device=self.device)
+                num_sampled_list.append(1)
+                num_rejected_list.append(len(tokens) - 1)
+
+            # num_sampled must be the TOTAL tokens produced per request
+            # (bonus + accepted drafts), because AsyncOutput truncates
+            # sampled_token_ids rows to num_sampled length.
+            num_sampled_vals = []
+            num_rejected_vals = []
+            for tokens in result_tokens:
+                num_sampled_vals.append(len(tokens))
+                num_rejected_vals.append(max(num_draft_tokens - (len(tokens) - 1), 0))
+            can_sample_np = input_batch.seq_lens_np[:num_reqs] >= input_batch.prefill_len_np
+            num_sampled_np = np.array(num_sampled_vals, dtype=np.int32)
+            num_sampled_np = num_sampled_np * can_sample_np.astype(np.int32)
+            num_sampled = async_copy_to_gpu(num_sampled_np, device=self.device)
+            num_rejected = torch.tensor(num_rejected_vals, dtype=torch.int32, device=self.device)
+
+            sampler_output = SamplerOutput(
+                sampled_token_ids=sampled_ids,
+                logprobs_tensors=None,
+                num_nans=None,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+            )
+        else:
+            sampler_output = self.sampler(logits, input_batch)
+            can_sample_np = input_batch.seq_lens_np[: input_batch.num_reqs] >= input_batch.prefill_len_np
+            num_sampled = async_copy_to_gpu(can_sample_np.astype(np.int32), device=self.device)
+            num_rejected = torch.zeros_like(num_sampled)
+            sampler_output.num_sampled = num_sampled
+            sampler_output.num_rejected = num_rejected
         return sampler_output, num_sampled, num_rejected
 
     def postprocess_sampled(
@@ -903,6 +986,7 @@ class NPUModelRunner310V2(NPUModelRunner):
     ) -> None:
         # TODO: Refactor this 310P state update to use Triton Dispatcher after
         # vLLM RFC #45133 lands.
+        # Supports multi-token rows (spec decode: bonus + accepted drafts).
         del num_rejected
         num_entries = min(idx_mapping.shape[0], sampled_tokens.shape[0], num_sampled.shape[0])
         idx_mapping = idx_mapping[:num_entries]
@@ -910,22 +994,31 @@ class NPUModelRunner310V2(NPUModelRunner):
         num_sampled = num_sampled[:num_entries]
         valid_mask = idx_mapping >= 0
         valid_indices = idx_mapping.masked_select(valid_mask)
-        sampled = sampled_tokens[:, 0].masked_select(valid_mask).to(self.req_states.last_sampled_tokens.dtype)
+        valid_rows = valid_mask.nonzero(as_tuple=True)[0]
         valid_num_sampled = num_sampled.masked_select(valid_mask)
-        has_sample = valid_num_sampled > 0
 
-        token_positions = self.req_states.total_len.gpu[valid_indices].to(torch.int64)
-        old_tokens = self.req_states.all_token_ids.gpu[valid_indices, token_positions]
-        stored_tokens = torch.where(has_sample, sampled.to(torch.int32), old_tokens)
-        self.req_states.all_token_ids.gpu.index_put_((valid_indices, token_positions), stored_tokens)
-        old_last = self.req_states.last_sampled_tokens[valid_indices, 0]
-        self.req_states.last_sampled_tokens.index_copy_(
-            0,
-            valid_indices,
-            torch.where(has_sample, sampled, old_last).unsqueeze(-1),
-        )
-        self.req_states.total_len.gpu.index_add_(0, valid_indices, valid_num_sampled)
+        # Write every produced token (bonus + accepted drafts) into the
+        # token history, starting at the request's current total length.
+        idx_np = idx_mapping.cpu().numpy()
+        sampled_np = sampled_tokens.cpu().numpy()
+        num_sampled_np = num_sampled.cpu().numpy()
+        total_len_gpu = self.req_states.total_len.gpu
+        all_token_ids = self.req_states.all_token_ids.gpu
+        for row in valid_rows.tolist():
+            req_idx = int(idx_np[row])
+            n = int(num_sampled_np[row])
+            if n <= 0:
+                continue
+            start_pos = int(total_len_gpu[req_idx].item())
+            tokens = sampled_np[row, :n]
+            for j, tok in enumerate(tokens):
+                all_token_ids[req_idx, start_pos + j] = int(tok)
+            # last_sampled_tokens = the last produced token.
+            self.req_states.last_sampled_tokens[req_idx, 0] = int(tokens[-1])
+            total_len_gpu[req_idx] += n
 
+        # Advance num_computed_tokens by the number of newly committed tokens
+        # (query covered bonus + draft slots; accepted tokens are now computed).
         if query_start_loc is not None:
             query_lens = self._get_valid_query_lens(idx_mapping, query_start_loc)
             self._advance_num_computed_tokens(valid_indices, query_lens)
