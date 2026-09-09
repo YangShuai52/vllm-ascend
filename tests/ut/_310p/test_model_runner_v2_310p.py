@@ -86,15 +86,15 @@ def test_310p_v2_does_not_advertise_shared_kv_backing() -> None:
     assert NPUModelRunner310V2.supports_standardized_shared_kv_backing is False
 
 
-def test_310p_hybrid_postprocess_filters_padding_indices() -> None:
+def test_310p_hybrid_postprocess_updates_request_indices() -> None:
     state = object.__new__(Ascend310PMambaHybridModelState)
     state.num_accepted_tokens_gpu = torch.zeros(4, dtype=torch.int32)
-    idx_mapping = torch.tensor([0, -1, 2], dtype=torch.int32)
+    idx_mapping = torch.tensor([0, 2], dtype=torch.int32)
 
     state.postprocess_state(idx_mapping, num_sampled=3)
     torch.testing.assert_close(state.num_accepted_tokens_gpu, torch.tensor([3, 0, 3, 0], dtype=torch.int32))
 
-    num_sampled = torch.tensor([2, 9, 4], dtype=torch.int32)
+    num_sampled = torch.tensor([2, 4], dtype=torch.int32)
     state.postprocess_state(idx_mapping, num_sampled=num_sampled)
     torch.testing.assert_close(state.num_accepted_tokens_gpu, torch.tensor([2, 0, 4, 0], dtype=torch.int32))
 

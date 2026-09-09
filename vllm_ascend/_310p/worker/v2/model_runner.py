@@ -73,6 +73,8 @@ class NPUModelRunner310V2(NPUModelRunner):
         self.input_ids_cpu = torch.zeros(self.max_num_tokens, dtype=torch.int32, device="cpu")
         self.positions_cpu = torch.zeros(self.max_num_tokens, dtype=torch.int64, device="cpu")
         self.next_prefill_tokens_cpu = torch.zeros(self.max_num_reqs, dtype=torch.int32, device="cpu")
+        self._postprocess_idx_mapping_np = np.empty(0, dtype=np.int32)
+        self._postprocess_query_lens_np = np.empty(0, dtype=np.int32)
         # PrefillCacheHit / ChunkedPrefill must not replay FULL mixed ACLGraphs
         # (same as MRv1 `_determine_batch_execution_and_padding`). FULL_DECODE_ONLY
         # already keeps those batches eager via mixed_mode=NONE.
@@ -158,6 +160,10 @@ class NPUModelRunner310V2(NPUModelRunner):
             count=num_reqs,
         )
         idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        # Keep CPU metadata for postprocess_sampled. Reusing it avoids copying
+        # idx_mapping/query lengths back from the NPU after every decode step.
+        self._postprocess_idx_mapping_np = idx_mapping_np
+        self._postprocess_query_lens_np = num_scheduled_tokens
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         query_start_loc_np = np.empty(self.max_num_reqs + 2, dtype=np.int32)
@@ -374,13 +380,17 @@ class NPUModelRunner310V2(NPUModelRunner):
         self.req_states.num_computed_tokens_cpu.copy_(torch.from_numpy(np_vals))
         self.req_states.num_computed_tokens.cpu.copy_(torch.from_numpy(np_vals))
 
-    def _advance_num_computed_tokens(self, valid_indices: torch.Tensor, query_lens: torch.Tensor) -> None:
+    def _advance_num_computed_tokens(
+        self,
+        valid_indices: torch.Tensor,
+        query_lens: torch.Tensor,
+        valid_indices_np: np.ndarray,
+        query_lens_np: np.ndarray,
+    ) -> None:
         """Advance per-request computed counts on both CPU mirror and GPU tensor."""
         if valid_indices.numel() == 0:
             return
-        vi = valid_indices.detach().cpu().numpy()
-        ql = query_lens.detach().cpu().numpy().astype(np.int32, copy=False)
-        self.req_states.num_computed_tokens_np[vi] += ql
+        self.req_states.num_computed_tokens_np[valid_indices_np] += query_lens_np
         self.req_states.num_computed_tokens.gpu.index_add_(
             0,
             valid_indices,
@@ -881,10 +891,13 @@ class NPUModelRunner310V2(NPUModelRunner):
         idx_mapping = idx_mapping[:num_entries]
         sampled_tokens = sampled_tokens[:num_entries]
         num_sampled = num_sampled[:num_entries]
-        valid_mask = idx_mapping >= 0
-        valid_indices = idx_mapping.masked_select(valid_mask)
-        sampled = sampled_tokens[:, 0].masked_select(valid_mask).to(self.req_states.last_sampled_tokens.dtype)
-        valid_num_sampled = num_sampled.masked_select(valid_mask)
+        # 310P builds idx_mapping from the real request IDs only. ACLGraph
+        # padding extends query_start_loc, not idx_mapping (see prepare_inputs).
+        # Avoid masked_select here: it is particularly expensive on 310P and
+        # there cannot be a -1 padding entry on this hot path.
+        valid_indices = idx_mapping
+        sampled = sampled_tokens[:num_entries, 0].to(self.req_states.last_sampled_tokens.dtype)
+        valid_num_sampled = num_sampled
         has_sample = valid_num_sampled > 0
 
         token_positions = self.req_states.total_len.gpu[valid_indices].to(torch.int64)
@@ -900,19 +913,14 @@ class NPUModelRunner310V2(NPUModelRunner):
         self.req_states.total_len.gpu.index_add_(0, valid_indices, valid_num_sampled)
 
         if query_start_loc is not None:
-            query_lens = self._get_valid_query_lens(idx_mapping, query_start_loc)
-            self._advance_num_computed_tokens(valid_indices, query_lens)
+            query_lens = query_start_loc[1 : num_entries + 1] - query_start_loc[:num_entries]
+            self._advance_num_computed_tokens(
+                valid_indices,
+                query_lens,
+                self._postprocess_idx_mapping_np[:num_entries],
+                self._postprocess_query_lens_np[:num_entries],
+            )
         self.model_state.postprocess_state(idx_mapping, num_sampled)
-
-    @staticmethod
-    def _get_valid_query_lens(
-        idx_mapping: torch.Tensor,
-        query_start_loc: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return real request query lengths without ACLGraph padding."""
-        num_query_lens = min(idx_mapping.shape[0], query_start_loc.shape[0] - 1)
-        query_lens = query_start_loc[1 : num_query_lens + 1] - query_start_loc[:num_query_lens]
-        return query_lens.masked_select(idx_mapping[:num_query_lens] >= 0)
 
     def postprocess_num_computed_tokens(self, input_batch: AscendInputBatch) -> None:
         # ``postprocess_sampled`` already advances ``num_computed_tokens`` on

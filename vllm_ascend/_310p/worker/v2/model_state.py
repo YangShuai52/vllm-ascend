@@ -279,12 +279,12 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
         # Upstream uses Triton scatter kernels. On 310P the decorated kernel is
-        # unusable; keep the op Triton-free via NPU indexing. Filter padding
-        # ``-1`` indices: ``index_fill_`` treats ``-1`` as the last slot.
+        # unusable; keep the op Triton-free via NPU indexing. The 310P runner
+        # constructs idx_mapping from real request IDs only; ACLGraph padding
+        # extends query_start_loc instead of adding -1 entries here.
         del num_computed_tokens
 
-        valid = idx_mapping >= 0
-        valid_indices = idx_mapping.masked_select(valid).to(dtype=torch.long)
+        valid_indices = idx_mapping.to(dtype=torch.long)
         if valid_indices.numel() == 0:
             return
 
@@ -292,5 +292,5 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
             DeviceOperator.index_fill(self.num_accepted_tokens_gpu, 0, valid_indices, max(num_sampled, 1))
             return
 
-        accepted = torch.clamp(num_sampled.masked_select(valid), min=1).to(self.num_accepted_tokens_gpu.dtype)
+        accepted = torch.clamp(num_sampled, min=1).to(self.num_accepted_tokens_gpu.dtype)
         self.num_accepted_tokens_gpu.index_copy_(0, valid_indices, accepted)
