@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "kernel_operator.h"
-#include "postprocess_sampled_v310_tiling_data.h"
 
 using namespace AscendC;
 
