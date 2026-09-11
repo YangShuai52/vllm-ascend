@@ -36,6 +36,31 @@
 namespace vllm_ascend {
 namespace meta {
 const int64_t INT4_NUMS_IN_INT32 = 8;
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> post_update_310_meta(
+    const at::Tensor& idx_mapping,
+    at::Tensor num_computed_tokens,
+    at::Tensor last_sampled_tokens,
+    at::Tensor output_bin_counts,
+    const at::Tensor& sampled_tokens,
+    const at::Tensor& num_sampled,
+    const at::Tensor& num_rejected,
+    const at::Tensor& query_start_loc,
+    at::Tensor all_token_ids,
+    at::Tensor total_len,
+    bool has_output_bin_counts,
+    bool has_query_start_loc)
+{
+    (void)idx_mapping;
+    (void)output_bin_counts;
+    (void)sampled_tokens;
+    (void)num_sampled;
+    (void)num_rejected;
+    (void)query_start_loc;
+    (void)has_output_bin_counts;
+    (void)has_query_start_loc;
+    return {num_computed_tokens, last_sampled_tokens, all_token_ids, total_len};
+}
 constexpr int64_t DSA_SLOT_MAPPING_FLAT = 1;
 constexpr int64_t DSA_SLOT_MAPPING_BLOCK_OFFSET = 2;
 
@@ -2051,6 +2076,7 @@ std::tuple<at::Tensor, at::Tensor> situ_mx_quant_meta(
 // Pybind on Ascend 310P
 namespace {
 TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
+    ops.impl("post_update_310", &vllm_ascend::meta::post_update_310_meta);
     // causal_conv1d_310
     ops.impl("npu_causal_conv1d_310", &vllm_ascend::meta::npu_causal_conv1d_310_meta);
     // npu_recurrent_gated_delta_rule_310

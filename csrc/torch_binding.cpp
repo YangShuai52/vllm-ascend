@@ -45,6 +45,7 @@
 #include "attention/fused_sparse_attention_overlap/fused_sparse_attention_overlap_torch_adpt.h"
 #include "attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
+#include "moe/postprocess_sampled_v310/postprocess_sampled_310_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
 #include "attention/recurrent_kda/recurrent_kda_torch_adpt.h"
 #include "attention/chunk_kda_fwd/chunk_kda_fwd_torch_adpt.h"
@@ -2749,6 +2750,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                   Tensor? num_accepted_tokens, "
         "                                   float scale_value=1.0) -> (Tensor output)");
     ops.impl("npu_recurrent_gated_delta_rule_310", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule_310);
+
+    ops.def(
+        "post_update_310(Tensor idx_mapping, Tensor(a!) num_computed_tokens, "
+        "Tensor(b!) last_sampled_tokens, Tensor(c!) output_bin_counts, Tensor sampled_tokens, "
+        "Tensor num_sampled, Tensor num_rejected, Tensor query_start_loc, "
+        "Tensor(d!) all_token_ids, Tensor(e!) total_len, bool has_output_bin_counts, "
+        "bool has_query_start_loc) -> (Tensor(a!), Tensor(b!), Tensor(d!), Tensor(e!))");
+    ops.impl("post_update_310", torch::kPrivateUse1, &vllm_ascend::post_update_310);
 
     ops.def(
         "chunk_gated_delta_rule_fwd_h(Tensor k, Tensor w, Tensor u, Tensor? g=None, *, Tensor? gk=None, Tensor? initial_state=None, bool? output_final_state=False, int? chunk_size=None, bool? save_new_value=True, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? use_exp2=False, bool? transpose_state_layout=False) -> (Tensor h_out, Tensor v_new_out, Tensor final_state_out)"

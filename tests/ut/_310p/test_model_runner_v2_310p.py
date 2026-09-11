@@ -333,89 +333,84 @@ def test_update_seq_lens_cpu_only_marks_scheduler_changed_rows() -> None:
     np.testing.assert_array_equal(runner.input_buffers.seq_lens_np, [5, 5])
 
 
-def test_advance_num_computed_tokens_uses_cpu_metadata() -> None:
-    runner = object.__new__(NPUModelRunner310V2)
-    runner.req_states = SimpleNamespace(
-        num_computed_tokens_np=np.array([5, 7, 11], dtype=np.int32),
-        num_computed_tokens_cpu=torch.tensor([5, 7, 11], dtype=torch.int32),
-        num_computed_tokens=SimpleNamespace(
-            cpu=torch.tensor([5, 7, 11], dtype=torch.int32),
-            gpu=torch.tensor([5, 7, 11], dtype=torch.int32),
-        ),
-    )
+def test_post_update_310_dispatches_fused_op() -> None:
+    fused_op = MagicMock()
+    fake_ops = SimpleNamespace(_C_ascend=SimpleNamespace(post_update_310=fused_op))
+    idx_mapping = torch.tensor([1, 0], dtype=torch.int32)
+    num_computed_tokens = torch.zeros(2, dtype=torch.int32)
+    last_sampled_tokens = torch.zeros((2, 1), dtype=torch.int64)
+    output_bin_counts = torch.zeros((2, 32), dtype=torch.int32)
+    sampled_tokens = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
+    num_sampled = torch.tensor([2, 1], dtype=torch.int32)
+    num_rejected = torch.tensor([0, 1], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+    all_token_ids = torch.zeros((2, 8), dtype=torch.int32)
+    total_len = torch.zeros(2, dtype=torch.int32)
 
-    runner._advance_num_computed_tokens(
-        torch.tensor([2, 0], dtype=torch.int64),
-        torch.tensor([3, 1], dtype=torch.int32),
-        np.array([2, 0], dtype=np.int32),
-        np.array([3, 1], dtype=np.int32),
-    )
-
-    np.testing.assert_array_equal(runner.req_states.num_computed_tokens_np, [6, 7, 14])
-    torch.testing.assert_close(runner.req_states.num_computed_tokens_cpu, torch.tensor([6, 7, 14]))
-    torch.testing.assert_close(runner.req_states.num_computed_tokens.cpu, torch.tensor([6, 7, 14]))
-    torch.testing.assert_close(runner.req_states.num_computed_tokens.gpu, torch.tensor([6, 7, 14]))
-
-
-@pytest.mark.parametrize(
-    ("sampled_tokens", "num_sampled", "query_lens", "expected_advance"),
-    [
-        ([[101], [102]], [0, 0], [3, 2], [3, 2]),
-        ([[101, 102, -1], [201, -1, -1]], [2, 1], [3, 3], [2, 1]),
-    ],
-)
-def test_mtp_postprocess_keeps_cpu_bookkeeping(
-    sampled_tokens,
-    num_sampled,
-    query_lens,
-    expected_advance,
-) -> None:
-    class FakeStagedTensor:
-        def __init__(self, values):
-            self.np = np.array(values, dtype=np.int32)
-            self.cpu = torch.tensor(values, dtype=torch.int32)
-            self.gpu = torch.tensor(values, dtype=torch.int32)
-
-        def stage_write_elem(self, index, value):
-            self.np[index] = value
-            self.cpu[index] = value
-
-    runner = object.__new__(NPUModelRunner310V2)
-    runner.device = torch.device("cpu")
-    runner.speculator = object()
-    runner._postprocess_idx_mapping_np = np.array([1, 0], dtype=np.int32)
-    runner._postprocess_query_lens_np = np.array(query_lens, dtype=np.int32)
-    runner.req_states = SimpleNamespace(
-        all_token_ids=SimpleNamespace(np=np.zeros((2, 16), dtype=np.int32)),
-        total_len=FakeStagedTensor([5, 7]),
-        last_sampled_tokens=torch.zeros((2, 1), dtype=torch.int64),
-        num_computed_tokens_np=np.array([5, 7], dtype=np.int32),
-        num_computed_tokens_cpu=torch.tensor([5, 7], dtype=torch.int32),
-        num_computed_tokens=FakeStagedTensor([5, 7]),
-    )
-    runner.model_state = MagicMock()
-
-    def copy_to_device(value, **_kwargs):
-        return torch.from_numpy(value) if isinstance(value, np.ndarray) else value
-
-    sampled = torch.tensor(sampled_tokens, dtype=torch.int32)
-    counts = torch.tensor(num_sampled, dtype=torch.int32)
-    with patch.object(model_runner_module, "async_copy_to_gpu", side_effect=copy_to_device):
-        runner.postprocess_sampled(
-            torch.tensor([1, 0], dtype=torch.int32),
-            sampled,
-            counts,
-            torch.zeros_like(counts),
-            torch.tensor([0, query_lens[0], sum(query_lens)], dtype=torch.int32),
+    with patch.object(model_runner_module.torch, "ops", fake_ops):
+        model_runner_module._post_update_310(
+            idx_mapping,
+            num_computed_tokens,
+            last_sampled_tokens,
+            output_bin_counts,
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            query_start_loc,
+            all_token_ids,
+            total_len,
         )
 
-    expected = np.array([5, 7], dtype=np.int32)
-    expected[[1, 0]] += expected_advance
-    np.testing.assert_array_equal(runner.req_states.num_computed_tokens_np, expected)
-    torch.testing.assert_close(runner.req_states.num_computed_tokens.gpu, torch.from_numpy(expected))
-    if sampled.shape[1] > 1:
-        np.testing.assert_array_equal(runner.req_states.all_token_ids.np[1, 7:9], [101, 102])
-        np.testing.assert_array_equal(runner.req_states.all_token_ids.np[0, 5:6], [201])
+    fused_op.assert_called_once_with(
+        idx_mapping,
+        num_computed_tokens,
+        last_sampled_tokens,
+        output_bin_counts,
+        sampled_tokens,
+        num_sampled,
+        num_rejected,
+        query_start_loc,
+        all_token_ids,
+        total_len,
+        True,
+        True,
+    )
+
+
+def test_postprocess_sampled_uses_ascendc_and_syncs_mtp_state() -> None:
+    runner = object.__new__(NPUModelRunner310V2)
+    runner.is_last_pp_rank = False
+    runner.speculator = object()
+    runner.req_states = SimpleNamespace(
+        num_computed_tokens=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int32)),
+        last_sampled_tokens=torch.zeros((2, 1), dtype=torch.int64),
+        all_token_ids=SimpleNamespace(gpu=torch.zeros((2, 8), dtype=torch.int32)),
+        total_len=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int32)),
+    )
+    runner.model_state = MagicMock()
+    runner._copy_num_computed_tokens_to_cpu = MagicMock()
+    idx_mapping = torch.tensor([1, 0], dtype=torch.int32)
+    sampled_tokens = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
+    num_sampled = torch.tensor([2, 1], dtype=torch.int32)
+    num_rejected = torch.tensor([0, 1], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+
+    with patch.object(model_runner_module, "_post_update_310") as post_update:
+        runner.postprocess_sampled(
+            idx_mapping,
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            query_start_loc,
+        )
+
+    post_update.assert_called_once()
+    runner.model_state.postprocess_state.assert_called_once_with(
+        idx_mapping,
+        num_sampled,
+        runner.req_states.num_computed_tokens.gpu,
+    )
+    runner._copy_num_computed_tokens_to_cpu.assert_called_once_with()
 
 
 @pytest.mark.parametrize(("finished_req_ids", "sync_count"), [({"finished"}, 1), (set(), 0)])
@@ -703,15 +698,6 @@ def test_model_state_only_refreshes_seq_lens_for_full_runtime() -> None:
 
         model_state.prepare_attn(input_batch, CUDAGraphMode.FULL, (), object(), [], object())
         torch.testing.assert_close(capture_seq_lens, input_batch.seq_lens)
-
-
-def test_aclgraph_query_lens_ignore_padded_request_entries() -> None:
-    query_lens = NPUModelRunner310V2._get_valid_query_lens(
-        torch.tensor([3, 7, -1, -1], dtype=torch.int32),
-        torch.tensor([0, 2, 5], dtype=torch.int32),
-    )
-
-    torch.testing.assert_close(query_lens, torch.tensor([2, 3], dtype=torch.int32))
 
 
 def test_worker_selects_v2_runner_on_310p() -> None:
