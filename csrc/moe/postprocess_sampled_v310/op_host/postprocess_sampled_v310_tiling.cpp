@@ -49,15 +49,19 @@ static ge::graphStatus Tiling(gert::TilingContext* context)
                 OP_LOGE(context, "queryStartLoc must have at least numReqs + 1 elements"),
                 return ge::GRAPH_FAILED);
 
-    auto* tiling = context->GetTilingData<PostprocessSampledV310TilingData>();
-    OP_CHECK_NULL_WITH_CONTEXT(context, tiling);
-    tiling->set_numReqs(idxStorage.GetDim(0));
-    tiling->set_sampledStride(sampledStorage.GetDim(1));
-    tiling->set_tokenStride(tokenStorage.GetDim(1));
-    tiling->set_outputBinCountsStride(
+    PostprocessSampledV310TilingData tiling;
+    tiling.set_numReqs(idxStorage.GetDim(0));
+    tiling.set_sampledStride(sampledStorage.GetDim(1));
+    tiling.set_tokenStride(tokenStorage.GetDim(1));
+    tiling.set_outputBinCountsStride(
         outputBinCountsStorage.GetDimNum() == 2 ? outputBinCountsStorage.GetDim(1) : 0);
-    tiling->set_hasOutputBinCounts(*hasOutputBinCounts ? 1 : 0);
-    tiling->set_hasQueryStartLoc(*hasQueryStartLoc ? 1 : 0);
+    tiling.set_hasOutputBinCounts(*hasOutputBinCounts ? 1 : 0);
+    tiling.set_hasQueryStartLoc(*hasQueryStartLoc ? 1 : 0);
+
+    auto* rawTilingData = context->GetRawTilingData();
+    OP_CHECK_NULL_WITH_CONTEXT(context, rawTilingData);
+    tiling.SaveToBuffer(rawTilingData->GetData(), rawTilingData->GetCapacity());
+    rawTilingData->SetDataSize(tiling.GetDataSize());
 
     fe::PlatFormInfos* platformInfo = context->GetPlatformInfo();
     OP_CHECK_NULL_WITH_CONTEXT(context, platformInfo);
