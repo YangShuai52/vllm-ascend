@@ -541,6 +541,28 @@ def test_block_table_expands_logical_blocks_to_310p_kernel_blocks() -> None:
     assert block_tables.block_tables_cpu[0][0, :2].tolist() == [14, 15]
 
 
+def test_slot_mapping_copies_only_active_prefix() -> None:
+    block_tables = Ascend310PBlockTables(
+        block_sizes=[4],
+        max_num_reqs=1,
+        max_num_batched_tokens=8,
+        max_num_blocks_per_group=[2],
+        device=torch.device("cpu"),
+    )
+    block_tables.append_block_ids(0, ([3],), overwrite=True)
+    block_tables.slot_mappings.fill_(99)
+
+    slots = block_tables.compute_slot_mappings(
+        np.array([0], dtype=np.int32),
+        np.array([0, 2], dtype=np.int32),
+        np.array([0, 1], dtype=np.int64),
+        num_tokens_padded=4,
+    )
+
+    torch.testing.assert_close(slots, torch.tensor([[12, 13, -1, -1]], dtype=torch.int32))
+    torch.testing.assert_close(block_tables.slot_mappings[:, 4:], torch.full((1, 4), 99, dtype=torch.int32))
+
+
 def test_kv_cache_allocation_uses_separate_nz_k_and_v() -> None:
     class FakeAttentionSpec:
         block_size = 128

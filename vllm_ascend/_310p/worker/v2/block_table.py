@@ -156,7 +156,15 @@ class Ascend310PBlockTables(BlockTables):
         if query_start_loc_np.shape[0] < idx_mapping_np.shape[0] + 1:
             raise ValueError("query_start_loc does not contain all request boundaries.")
 
-        self.slot_mappings_cpu.fill(PAD_SLOT_ID)
+        if num_tokens_padded > self.max_num_batched_tokens:
+            raise ValueError(
+                f"num_tokens_padded ({num_tokens_padded}) exceeds slot-mapping capacity "
+                f"({self.max_num_batched_tokens})."
+            )
+        # Match MRV1 CpuGpuBuffer.copy_to_gpu(num_tokens): initialize and
+        # transfer only active columns. Copying the complete maximum-size
+        # buffer is especially costly for small decode batches.
+        self.slot_mappings_cpu[:, :num_tokens_padded].fill(PAD_SLOT_ID)
         for group_id, (block_table, block_size) in enumerate(zip(self.block_tables_cpu, self.kernel_block_sizes)):
             for batch_idx, req_idx in enumerate(idx_mapping_np):
                 start = int(query_start_loc_np[batch_idx])
@@ -168,7 +176,11 @@ class Ascend310PBlockTables(BlockTables):
                 self.slot_mappings_cpu[group_id, start:end] = block_numbers * block_size + block_offsets
 
         device_slots = self.slot_mappings if out is None else out
-        device_slots.copy_(self._slot_mappings_cpu_tensor, non_blocking=True)
+        for group_id in range(self.num_kv_cache_groups):
+            device_slots[group_id, :num_tokens_padded].copy_(
+                self._slot_mappings_cpu_tensor[group_id, :num_tokens_padded],
+                non_blocking=True,
+            )
         return device_slots[:, :num_tokens_padded]
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
