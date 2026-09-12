@@ -48,6 +48,8 @@
 #include "moe/postprocess_sampled_v310/postprocess_sampled_310_torch_adpt.h"
 #include "moe/preprocess_mamba_align_v310/preprocess_mamba_align_310_torch_adpt.h"
 #include "moe/precopy_mamba_align_v310/precopy_mamba_align_310_torch_adpt.h"
+#include "moe/postprocess_mamba_align_v310/postprocess_mamba_align_310_torch_adpt.h"
+#include "moe/update_mamba_num_accepted_v310/update_mamba_num_accepted_310_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
 #include "attention/recurrent_kda/recurrent_kda_torch_adpt.h"
 #include "attention/chunk_kda_fwd/chunk_kda_fwd_torch_adpt.h"
@@ -2776,6 +2778,23 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor idx_mapping, int num_reqs, int block_table_stride_req, bool conv_state_dim_first) "
         "-> Tensor(a!)");
     ops.impl("precopy_mamba_align_310", torch::kPrivateUse1, &vllm_ascend::precopy_mamba_align_310);
+
+    ops.def(
+        "postprocess_mamba_align_310(Tensor idx_mapping, Tensor(a!) num_accepted_tokens, "
+        "Tensor state_idx, Tensor num_computed_tokens, "
+        "Tensor block_table_ptrs, Tensor state_base_addrs, Tensor state_block_strides, "
+        "Tensor state_elem_sizes, Tensor state_inner_sizes, Tensor state_conv_widths, "
+        "Tensor state_group_indices, Tensor state_dim_row_count, Tensor state_dim_row_stride, "
+        "int num_reqs, int block_size, int block_table_stride_req, "
+        "bool conv_state_dim_first) "
+        "-> Tensor(a!)");
+    ops.impl("postprocess_mamba_align_310", torch::kPrivateUse1, &vllm_ascend::postprocess_mamba_align_310);
+
+    ops.def(
+        "update_mamba_num_accepted_310(Tensor idx_mapping, Tensor num_sampled, "
+        "Tensor(a!) num_accepted_tokens, int num_reqs, int scalar_num_sampled, "
+        "bool has_tensor_num_sampled) -> Tensor(a!)");
+    ops.impl("update_mamba_num_accepted_310", torch::kPrivateUse1, &vllm_ascend::update_mamba_num_accepted_310);
 
     ops.def(
         "chunk_gated_delta_rule_fwd_h(Tensor k, Tensor w, Tensor u, Tensor? g=None, *, Tensor? gk=None, Tensor? initial_state=None, bool? output_final_state=False, int? chunk_size=None, bool? save_new_value=True, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? use_exp2=False, bool? transpose_state_layout=False) -> (Tensor h_out, Tensor v_new_out, Tensor final_state_out)"

@@ -114,6 +114,46 @@ at::Tensor precopy_mamba_align_310_meta(
     (void)conv_state_dim_first;
     return state_idx;
 }
+
+at::Tensor postprocess_mamba_align_310_meta(
+    const at::Tensor& idx_mapping,
+    at::Tensor num_accepted_tokens,
+    const at::Tensor& state_idx,
+    const at::Tensor& num_computed_tokens,
+    const at::Tensor& block_table_ptrs,
+    const at::Tensor& state_base_addrs,
+    const at::Tensor& state_block_strides,
+    const at::Tensor& state_elem_sizes,
+    const at::Tensor& state_inner_sizes,
+    const at::Tensor& state_conv_widths,
+    const at::Tensor& state_group_indices,
+    const at::Tensor& state_dim_row_count,
+    const at::Tensor& state_dim_row_stride,
+    int64_t num_reqs,
+    int64_t block_size,
+    int64_t block_table_stride_req,
+    bool conv_state_dim_first)
+{
+    (void)idx_mapping; (void)state_idx;
+    (void)num_computed_tokens; (void)block_table_ptrs;
+    (void)state_base_addrs; (void)state_block_strides;
+    (void)state_elem_sizes; (void)state_inner_sizes;
+    (void)state_conv_widths; (void)state_group_indices;
+    (void)state_dim_row_count; (void)state_dim_row_stride;
+    (void)num_reqs; (void)block_size; (void)block_table_stride_req;
+    (void)conv_state_dim_first;
+    return num_accepted_tokens;
+}
+
+at::Tensor update_mamba_num_accepted_310_meta(
+    const at::Tensor& idx_mapping, const at::Tensor& num_sampled,
+    at::Tensor num_accepted_tokens, int64_t num_reqs,
+    int64_t scalar_num_sampled, bool has_tensor_num_sampled)
+{
+    (void)idx_mapping; (void)num_sampled; (void)num_reqs;
+    (void)scalar_num_sampled; (void)has_tensor_num_sampled;
+    return num_accepted_tokens;
+}
 constexpr int64_t DSA_SLOT_MAPPING_FLAT = 1;
 constexpr int64_t DSA_SLOT_MAPPING_BLOCK_OFFSET = 2;
 
@@ -2132,6 +2172,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("post_update_310", &vllm_ascend::meta::post_update_310_meta);
     ops.impl("preprocess_mamba_align_310", &vllm_ascend::meta::preprocess_mamba_align_310_meta);
     ops.impl("precopy_mamba_align_310", &vllm_ascend::meta::precopy_mamba_align_310_meta);
+    ops.impl("postprocess_mamba_align_310", &vllm_ascend::meta::postprocess_mamba_align_310_meta);
+    ops.impl("update_mamba_num_accepted_310", &vllm_ascend::meta::update_mamba_num_accepted_310_meta);
     // causal_conv1d_310
     ops.impl("npu_causal_conv1d_310", &vllm_ascend::meta::npu_causal_conv1d_310_meta);
     // npu_recurrent_gated_delta_rule_310

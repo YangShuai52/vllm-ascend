@@ -19,7 +19,6 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
 from vllm_ascend._310p.worker.v2.rope import Ascend310PRopeState, get_310p_rope_state
-from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
@@ -348,19 +347,47 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
         num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
-        # Upstream uses Triton scatter kernels. On 310P the decorated kernel is
-        # unusable; keep the op Triton-free via NPU indexing. Filter padding
-        # ``-1`` indices: ``index_fill_`` treats ``-1`` as the last slot.
-        del num_computed_tokens
+        num_reqs = idx_mapping.shape[0]
+        if num_reqs:
+            tensor_num_sampled = not isinstance(num_sampled, int)
+            torch.ops._C_ascend.update_mamba_num_accepted_310(
+                idx_mapping,
+                num_sampled if tensor_num_sampled else self.num_accepted_tokens_gpu,
+                self.num_accepted_tokens_gpu,
+                num_reqs,
+                max(num_sampled, 1) if isinstance(num_sampled, int) else 1,
+                tensor_num_sampled,
+            )
 
-        valid = idx_mapping >= 0
-        valid_indices = idx_mapping.masked_select(valid).to(dtype=torch.long)
-        if valid_indices.numel() == 0:
+        if self.recoverssm is not None:
+            self.recoverssm.commit_step(
+                num_sampled,
+                idx_mapping,
+                state_indices=(self._mamba_state_idx_gpu if self._align_mode else None),
+                num_accepted_tokens=self.num_accepted_tokens_gpu,
+            )
+
+        if not num_reqs:
             return
 
-        if isinstance(num_sampled, int):
-            DeviceOperator.index_fill(self.num_accepted_tokens_gpu, 0, valid_indices, max(num_sampled, 1))
-            return
-
-        accepted = torch.clamp(num_sampled.masked_select(valid), min=1).to(self.num_accepted_tokens_gpu.dtype)
-        self.num_accepted_tokens_gpu.index_copy_(0, valid_indices, accepted)
+        if self._align_mode and num_computed_tokens is not None and self._mamba_ctx is not None:
+            ctx = self._mamba_ctx
+            torch.ops._C_ascend.postprocess_mamba_align_310(
+                idx_mapping,
+                self.num_accepted_tokens_gpu,
+                self._mamba_state_idx_gpu,
+                num_computed_tokens,
+                ctx.block_table_ptrs,
+                ctx.state_base_addrs,
+                ctx.state_block_strides,
+                ctx.state_elem_sizes,
+                ctx.state_inner_sizes,
+                ctx.state_conv_widths,
+                ctx.state_group_indices,
+                ctx.state_dim_row_count,
+                ctx.state_dim_row_stride,
+                num_reqs,
+                ctx.block_size,
+                ctx.block_table_stride_req,
+                is_conv_state_dim_first(),
+            )

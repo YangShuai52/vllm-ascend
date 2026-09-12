@@ -89,6 +89,8 @@ if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
         "postprocess_sampled_v310"
         "preprocess_mamba_align_v310"
         "precopy_mamba_align_v310"
+        "postprocess_mamba_align_v310"
+        "update_mamba_num_accepted_v310"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend310p"
