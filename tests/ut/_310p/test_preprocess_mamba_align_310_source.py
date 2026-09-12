@@ -26,6 +26,16 @@ def test_preprocess_state_plans_on_cpu_without_custom_ops() -> None:
     assert ".item()" not in preprocess
 
 
+def test_mamba_copy_api_matches_vllm_b2f685834a() -> None:
+    source = MODEL_STATE.read_text(encoding="utf-8")
+
+    assert "from vllm.v1.worker.mamba_utils import get_mamba_groups" in source
+    assert "self.model.get_mamba_state_copy_func()" in source
+    assert "_get_mamba_spec_for_layer" not in source
+    assert "validate_mamba_state_copy_funcs" not in source
+    assert "get_mamba_state_copy_funcs" not in source
+
+
 def test_preprocess_kernel_matches_upstream_state_transition() -> None:
     source = KERNEL.read_text(encoding="utf-8")
 

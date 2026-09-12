@@ -18,11 +18,7 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
     MambaHybridAttnMetadata,
     MambaHybridModelState,
 )
-from vllm.v1.worker.mamba_utils import (
-    _get_mamba_spec_for_layer,
-    get_mamba_groups,
-    validate_mamba_state_copy_funcs,
-)
+from vllm.v1.worker.mamba_utils import get_mamba_groups
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
@@ -179,20 +175,17 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
         self._num_accepted_tokens_cpu[req_index] = 1
         if not self._align_mode:
             return
-        # Seed running-state block from resumed prefix length. Use the Mamba
-        # page size (``mamba_block_size`` when APC+align is enabled) so the
-        # index matches ``mamba_get_block_table_tensor`` / ``MAMBA_BLOCK_SIZE``.
-        block_size = self.cache_config.mamba_block_size or self.cache_config.block_size
+        # b2f685834a uses cache_config.block_size as the align page size.
+        block_size = self.cache_config.block_size
         self._mamba_state_idx_cpu[req_index] = (new_req_data.num_computed_tokens - 1) // block_size
 
     def _ensure_mamba_copy_funcs_cpu(self, kv_cache_config: KVCacheConfig) -> None:
         if self._mamba_state_copy_funcs is not None:
             return
-        mamba_groups = get_mamba_groups(kv_cache_config)
-        mamba_types = {spec.mamba_type for spec in mamba_groups}
-        copy_funcs = self.model.get_mamba_state_copy_funcs(mamba_types)
-        validate_mamba_state_copy_funcs(mamba_groups, copy_funcs)
-        self._mamba_state_copy_funcs = copy_funcs
+        # API at vLLM b2f685834a: one copy-function tuple shared by all Mamba
+        # layers. Newer plural/per-Mamba-type API must not be referenced here.
+        self._mamba_group_ids, self._mamba_spec = get_mamba_groups(kv_cache_config)
+        self._mamba_state_copy_funcs = self.model.get_mamba_state_copy_func()
 
     def _copy_mamba_state_from_cpu_plan(
         self,
@@ -214,9 +207,7 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
             for layer_name in group.layer_names:
                 attention = forward_context[layer_name]
                 states: list[torch.Tensor] = attention.kv_cache
-                mamba_spec = _get_mamba_spec_for_layer(group, layer_name)
-                state_copy_funcs = self._mamba_state_copy_funcs[mamba_spec.mamba_type]
-                for state, copy_func in zip(states, state_copy_funcs):
+                for state, copy_func in zip(states, self._mamba_state_copy_funcs):
                     if "conv" in copy_func.__name__:
                         src = state[src_block]
                         dst = state[dst_block]
@@ -247,6 +238,8 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
         self._capture_seq_lens_by_ptr = {}
         self._replace_310p_rope_state(encoder_cache)
         self._num_accepted_tokens_cpu = np.ones(self.max_num_reqs, dtype=np.int32)
+        # b2f685834a parent does not define this later-branch cache.
+        self._mamba_state_copy_funcs = None
         if self._align_mode:
             self._mamba_state_idx_cpu = np.zeros(self.max_num_reqs, dtype=np.int32)
             self._current_mamba_block_tables_np: tuple[np.ndarray, ...] | None = None
