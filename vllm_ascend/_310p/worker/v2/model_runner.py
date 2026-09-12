@@ -56,33 +56,36 @@ from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 _ATTENTION_BLOCK_SIZE_LIMIT = 128 * 128
 
 
-def _post_update_310(
-    idx_mapping: torch.Tensor,
-    num_computed_tokens: torch.Tensor,
-    last_sampled_tokens: torch.Tensor,
-    output_bin_counts: torch.Tensor | None,
-    sampled_tokens: torch.Tensor,
-    num_sampled: torch.Tensor,
-    num_rejected: torch.Tensor,
-    query_start_loc: torch.Tensor | None,
-    all_token_ids: torch.Tensor,
-    total_len: torch.Tensor,
-) -> None:
-    """Ascend C equivalent of vLLM's Triton ``post_update``."""
-    torch.ops._C_ascend.post_update_310(
-        idx_mapping,
-        num_computed_tokens,
-        last_sampled_tokens,
-        output_bin_counts if output_bin_counts is not None else num_computed_tokens,
-        sampled_tokens,
-        num_sampled,
-        num_rejected,
-        query_start_loc if query_start_loc is not None else idx_mapping,
-        all_token_ids,
-        total_len,
-        output_bin_counts is not None,
-        query_start_loc is not None,
-    )
+def _post_update_cpu(
+    idx_mapping_np: np.ndarray,
+    query_start_loc_np: np.ndarray | None,
+    req_states: Ascend310PRequestState,
+    sampled_cpu: torch.Tensor,
+    num_sampled_cpu: torch.Tensor,
+    num_rejected_cpu: torch.Tensor,
+) -> torch.Tensor:
+    """Run upstream ``post_update`` from sampler-owned CPU results."""
+    for batch_idx, req_idx_value in enumerate(idx_mapping_np):
+        req_idx = int(req_idx_value)
+        if req_idx < 0:
+            continue
+        count = int(num_sampled_cpu[batch_idx])
+        total_len = int(req_states.total_len.np[req_idx])
+        if count > 0:
+            tokens = sampled_cpu[batch_idx, :count].to(dtype=req_states.all_token_ids.cpu.dtype)
+            req_states.all_token_ids.cpu[req_idx, total_len : total_len + count].copy_(tokens)
+            req_states.last_sampled_tokens_cpu[req_idx, 0] = tokens[-1]
+            req_states.total_len.np[req_idx] = total_len + count
+        query_len = (
+            0 if query_start_loc_np is None else int(query_start_loc_np[batch_idx + 1] - query_start_loc_np[batch_idx])
+        )
+        computed_delta = query_len - int(num_rejected_cpu[batch_idx])
+        if computed_delta:
+            req_states.num_computed_tokens_np[req_idx] += computed_delta
+            value = int(req_states.num_computed_tokens_np[req_idx])
+            req_states.num_computed_tokens_cpu[req_idx] = value
+            req_states.num_computed_tokens.cpu[req_idx] = value
+    return num_sampled_cpu
 
 
 class NPUModelRunner310V2(NPUModelRunner):
@@ -181,12 +184,9 @@ class NPUModelRunner310V2(NPUModelRunner):
             scheduler_output.scheduled_spec_decode_tokens,
             self.decode_query_len,
         )
-        # CPU owns bookkeeping. Upload only rows changed externally by the
-        # scheduler (rewind/resume/prefix hit); normal decode stays resident.
-        changed_req_indices = self._update_seq_lens_cpu(scheduler_output, req_ids)
-        # New requests were uploaded by apply_staged_writes. Cached requests can
-        # be rewound/resumed by the scheduler afterwards; upload only those rows.
-        self._sync_num_computed_tokens_gpu_from_np(changed_req_indices)
+        # CPU owns bookkeeping. Resolve scheduler rewinds/resumes first, then
+        # materialize one full request-count buffer for forward consumers.
+        self._update_seq_lens_cpu(scheduler_output, req_ids)
 
         num_scheduled_tokens = np.fromiter(
             map(num_tokens_per_req.get, req_ids),
@@ -218,14 +218,15 @@ class NPUModelRunner310V2(NPUModelRunner):
         idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
         # Postprocess owns request bookkeeping on CPU, like MRV1. Preserve the
         # exact batch order so it never has to copy indices/query lengths back.
+        self._postprocess_idx_mapping_np = idx_mapping_np
 
         num_draft_tokens_per_req = None
         if not draft_tokens_map:
             total_num_draft_tokens = 0
             cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
-            cu_num_logits = torch.arange(num_reqs + 1, device=self.device, dtype=torch.int32)
+            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
             expanded_idx_mapping = idx_mapping
-            expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
+            expanded_local_pos = async_copy_to_gpu(np.zeros(num_reqs, dtype=np.int32), device=self.device)
         else:
             num_draft_tokens_per_req = np.fromiter(
                 (len(draft_tokens_map.get(req_id, ())) for req_id in req_ids),
@@ -262,6 +263,7 @@ class NPUModelRunner310V2(NPUModelRunner):
             )
         async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
+        self._postprocess_query_start_loc_np = query_start_loc_np[: num_reqs + 1].copy()
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
 
         prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
@@ -269,18 +271,14 @@ class NPUModelRunner310V2(NPUModelRunner):
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
         batch_has_prefill = bool(np.any(is_prefilling_np))
         self.eplb.set_batch_phase(batch_has_prefill)
-        if batch_has_prefill:
-            self._prepare_prefill_inputs(
-                self.input_buffers.input_ids,
-                self.req_states.next_prefill_tokens,
-                idx_mapping,
-                query_start_loc,
-                self.req_states.all_token_ids.gpu,
-                self.req_states.prefill_len.gpu,
-                self.req_states.num_computed_tokens.gpu,
-                idx_mapping_np=idx_mapping_np,
-                query_start_loc_np=query_start_loc_np,
-            )
+        self._prepare_token_inputs_cpu(
+            idx_mapping_np,
+            query_start_loc_np,
+            prefill_len_np,
+            draft_tokens_map,
+            req_ids,
+            num_tokens_after_padding,
+        )
 
         self._prepare_pos_seq_lens(
             idx_mapping,
@@ -297,22 +295,19 @@ class NPUModelRunner310V2(NPUModelRunner):
         self.input_buffers.seq_lens_np[num_reqs:num_reqs_padded] = 0
         self.input_buffers.seq_lens_np[num_reqs_padded:] = 0
         total_num_logits = num_reqs if not draft_tokens_map else int(cu_num_logits_np[-1])
-        logits_indices = self._combine_sampled_and_draft_tokens(
-            self.input_buffers.input_ids,
-            idx_mapping,
-            self.req_states.last_sampled_tokens,
-            query_start_loc,
-            seq_lens,
-            self.req_states.prefill_len.gpu,
-            self.req_states.draft_tokens,
-            cu_num_logits,
-            total_num_logits,
-            self.model_state.num_new_sampled_tokens_per_step,
-            idx_mapping_np=idx_mapping_np,
-            query_start_loc_np=query_start_loc_np,
-            seq_lens_np=self.input_buffers.seq_lens_np[:num_reqs],
-            prefill_len_np=prefill_len_np,
-        )
+        logits_indices_np = np.empty(total_num_logits, dtype=np.int64)
+        for batch_idx in range(num_reqs):
+            logits_start = int(query_start_loc_np[batch_idx + 1]) - int(
+                cu_num_logits_np[batch_idx + 1] - cu_num_logits_np[batch_idx]
+            )
+            cu_start = int(cu_num_logits_np[batch_idx])
+            cu_end = int(cu_num_logits_np[batch_idx + 1])
+            logits_indices_np[cu_start:cu_end] = np.arange(
+                logits_start,
+                logits_start + cu_end - cu_start,
+                dtype=np.int64,
+            )
+        logits_indices = async_copy_to_gpu(logits_indices_np, device=self.device)
 
         seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_padded, dtype=np.int32)
         np.add(
@@ -353,6 +348,8 @@ class NPUModelRunner310V2(NPUModelRunner):
             prompt_lens=None,
             seq_lens_np=self.input_buffers.seq_lens_np,
             attn_state=attn_state,
+            input_ids_cpu=self.input_ids_cpu[:num_tokens_after_padding],
+            logits_indices_np=logits_indices_np,
         )
         input_batch_kwargs["has_prefill"] = batch_has_prefill
         input_batch = AscendInputBatch(**input_batch_kwargs)
@@ -524,29 +521,6 @@ class NPUModelRunner310V2(NPUModelRunner):
 
         manager.dispatch = dispatch  # type: ignore[method-assign]
         manager._310p_pc_eager_wrapped = True  # type: ignore[attr-defined]
-
-    def _sync_num_computed_tokens_gpu_from_np(self, req_indices: Sequence[int]) -> None:
-        """Upload scheduler-modified computed counts only.
-
-        Must run after ``add_requests`` / ``update_requests`` (see ``prepare_inputs``):
-        ``update_requests`` only refreshes the CPU/np mirror for cached requests,
-        and prefix-cache hits seed ``num_computed_tokens_np`` in ``add_request`` while
-        the GPU tensor may still hold a freed slot or pre-``apply_staged_writes``
-        value. Hybrid align ``preprocess_state`` reads the GPU tensor, so syncing too
-        early in ``execute_model`` leaves stale counts and corrupts recurrent state.
-        """
-        if not req_indices:
-            return
-        indices_np = np.asarray(req_indices, dtype=np.int64)
-        np_vals = self.req_states.num_computed_tokens_np[indices_np]
-        host = torch.tensor(np_vals, dtype=torch.int32)
-        gpu = self.req_states.num_computed_tokens.gpu
-        if host.dtype != gpu.dtype:
-            host = host.to(dtype=gpu.dtype)
-        indices = torch.tensor(indices_np, dtype=torch.int64, device=self.device)
-        gpu.index_copy_(0, indices, host.to(self.device, non_blocking=True))
-        self.req_states.num_computed_tokens_cpu[indices_np] = torch.from_numpy(np_vals)
-        self.req_states.num_computed_tokens.cpu[indices_np] = torch.from_numpy(np_vals)
 
     @torch.inference_mode()
     def execute_model(
@@ -1007,6 +981,48 @@ class NPUModelRunner310V2(NPUModelRunner):
         input_ids.copy_(self.input_ids_cpu[: input_ids.shape[0]], non_blocking=True)
         next_prefill_tokens.copy_(self.next_prefill_tokens_cpu, non_blocking=True)
 
+    def _prepare_token_inputs_cpu(
+        self,
+        idx_mapping_np: np.ndarray,
+        query_start_loc_np: np.ndarray,
+        prefill_len_np: np.ndarray,
+        draft_tokens_map: dict[str, list[int]] | None,
+        req_ids: list[str],
+        num_tokens_after_padding: int,
+    ) -> None:
+        """Build prefill/decode/MTP token input on CPU, then issue one H2D."""
+        draft_tokens_map = draft_tokens_map or {}
+        self.input_ids_cpu[:num_tokens_after_padding].zero_()
+        self.next_prefill_tokens_cpu.zero_()
+        for batch_idx, req_idx_value in enumerate(idx_mapping_np):
+            req_idx = int(req_idx_value)
+            start = int(query_start_loc_np[batch_idx])
+            end = int(query_start_loc_np[batch_idx + 1])
+            num_computed = int(self.req_states.num_computed_tokens_np[req_idx])
+            prefill_len = int(prefill_len_np[batch_idx])
+            if num_computed < prefill_len:
+                self.input_ids_cpu[start:end].copy_(
+                    self.req_states.all_token_ids.cpu[req_idx, num_computed : num_computed + end - start]
+                )
+                next_position = num_computed + end - start
+                if next_position < prefill_len:
+                    self.next_prefill_tokens_cpu[req_idx] = self.req_states.all_token_ids.cpu[req_idx, next_position]
+                continue
+
+            if end > start:
+                self.input_ids_cpu[start] = self.req_states.last_sampled_tokens_cpu[req_idx, 0]
+            drafts = draft_tokens_map.get(req_ids[batch_idx], ())
+            if drafts:
+                draft_count = min(len(drafts), end - start - 1)
+                self.input_ids_cpu[start + 1 : start + 1 + draft_count] = torch.tensor(
+                    drafts[:draft_count], dtype=self.input_ids_cpu.dtype
+                )
+
+        self.input_buffers.input_ids[:num_tokens_after_padding].copy_(
+            self.input_ids_cpu[:num_tokens_after_padding], non_blocking=True
+        )
+        self.req_states.next_prefill_tokens.copy_(self.next_prefill_tokens_cpu, non_blocking=True)
+
     def _prepare_pos_seq_lens(
         self,
         idx_mapping: torch.Tensor,
@@ -1076,6 +1092,9 @@ class NPUModelRunner310V2(NPUModelRunner):
             input_batch.idx_mapping_np,
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
+        input_batch.block_tables_np = tuple(
+            table[: input_batch.num_reqs_after_padding] for table in self.block_tables.input_block_tables_cpu
+        )
         positions_np = np.zeros(input_batch.num_tokens_after_padding, dtype=np.int64)
         for batch_idx, (start_position, num_scheduled_tokens) in enumerate(
             zip(input_batch.num_computed_tokens_np, input_batch.num_scheduled_tokens)
@@ -1110,6 +1129,9 @@ class NPUModelRunner310V2(NPUModelRunner):
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             sampler_output = self.sampler(logits, input_batch)
             can_sample_np = input_batch.seq_lens_np[: input_batch.num_reqs] >= input_batch.prefill_len_np
+            self._sampled_tokens_cpu = self.sampler.sampled_tokens_cpu
+            self._num_sampled_cpu = torch.from_numpy(can_sample_np.astype(np.int32))
+            self._num_rejected_cpu = torch.zeros_like(self._num_sampled_cpu)
             num_sampled = async_copy_to_gpu(can_sample_np.astype(np.int32), device=self.device)
             num_rejected = torch.zeros_like(num_sampled)
             sampler_output.num_sampled = num_sampled
@@ -1122,6 +1144,9 @@ class NPUModelRunner310V2(NPUModelRunner):
             input_batch,
             self.speculator.draft_logits,
         )
+        self._sampled_tokens_cpu = self.rejection_sampler.sampled_tokens_cpu
+        self._num_sampled_cpu = self.rejection_sampler.num_sampled_cpu
+        self._num_rejected_cpu = self.rejection_sampler.num_rejected_cpu
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
     def postprocess_sampled(
@@ -1132,31 +1157,28 @@ class NPUModelRunner310V2(NPUModelRunner):
         num_rejected: torch.Tensor,
         query_start_loc: torch.Tensor | None = None,
     ) -> None:
-        """Match upstream postprocess; replace only Triton ``post_update``."""
-        if self.is_last_pp_rank:
-            assert self.sampler is not None
-            output_bin_counts = self.sampler.penalties_state.output_bin_counts
-        else:
-            output_bin_counts = None
-        _post_update_310(
-            idx_mapping,
-            self.req_states.num_computed_tokens.gpu,
-            self.req_states.last_sampled_tokens,
-            output_bin_counts,
-            sampled_tokens,
-            num_sampled,
-            num_rejected,
-            query_start_loc,
-            self.req_states.all_token_ids.gpu,
-            self.req_states.total_len.gpu,
+        """Run request bookkeeping on CPU; upload only immediate NPU consumers."""
+        # CPU mirrors were produced during sampling. Device arguments remain in
+        # the upstream signature for MTP proposer/output compatibility.
+        del idx_mapping, sampled_tokens, num_sampled, num_rejected, query_start_loc
+        num_sampled_cpu = _post_update_cpu(
+            self._postprocess_idx_mapping_np,
+            self._postprocess_query_start_loc_np,
+            self.req_states,
+            self._sampled_tokens_cpu,
+            self._num_sampled_cpu,
+            self._num_rejected_cpu,
+        )
+        # MTP proposer consumes last_sampled immediately after this method.
+        self.req_states.last_sampled_tokens.copy_(
+            self.req_states.last_sampled_tokens_cpu,
+            non_blocking=True,
         )
         self.model_state.postprocess_state(
-            idx_mapping,
-            num_sampled,
-            self.req_states.num_computed_tokens.gpu,
+            torch.from_numpy(self._postprocess_idx_mapping_np),
+            num_sampled_cpu,
+            self.req_states.num_computed_tokens_cpu,
         )
-        if self.speculator is not None:
-            self._copy_num_computed_tokens_to_cpu()
 
     def _update_seq_lens_cpu(
         self,
@@ -1167,12 +1189,6 @@ class NPUModelRunner310V2(NPUModelRunner):
         cached_req_indices = [
             self.req_states.req_id_to_index[req_id] for req_id in scheduler_output.scheduled_cached_reqs.req_ids
         ]
-        if getattr(self, "speculator", None) is not None:
-            self.num_computed_tokens_event.synchronize()
-            for req_index in cached_req_indices:
-                value = self.num_computed_tokens_cpu[req_index]
-                self.req_states.num_computed_tokens_cpu[req_index] = value
-                self.req_states.num_computed_tokens_np[req_index] = int(value)
         changed_req_indices = [
             req_index
             for req_index in cached_req_indices
@@ -1190,6 +1206,5 @@ class NPUModelRunner310V2(NPUModelRunner):
         return changed_req_indices
 
     def postprocess_num_computed_tokens(self, input_batch: AscendInputBatch) -> None:
-        # ``postprocess_sampled`` already advances ``num_computed_tokens`` on
-        # the NPU via the Ascend C equivalent of upstream ``post_update``.
+        # ``postprocess_sampled`` already advances CPU-owned request state.
         del input_batch

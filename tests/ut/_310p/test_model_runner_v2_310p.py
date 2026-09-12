@@ -89,14 +89,17 @@ def test_310p_v2_does_not_advertise_shared_kv_backing() -> None:
 def test_310p_hybrid_postprocess_filters_padding_indices() -> None:
     state = object.__new__(Ascend310PMambaHybridModelState)
     state.num_accepted_tokens_gpu = torch.zeros(4, dtype=torch.int32)
+    state._num_accepted_tokens_cpu = np.zeros(4, dtype=np.int32)
+    state._align_mode = False
+    state.recoverssm = None
     idx_mapping = torch.tensor([0, -1, 2], dtype=torch.int32)
 
     state.postprocess_state(idx_mapping, num_sampled=3)
-    torch.testing.assert_close(state.num_accepted_tokens_gpu, torch.tensor([3, 0, 3, 0], dtype=torch.int32))
+    np.testing.assert_array_equal(state._num_accepted_tokens_cpu, np.array([3, 0, 3, 0], dtype=np.int32))
 
     num_sampled = torch.tensor([2, 9, 4], dtype=torch.int32)
     state.postprocess_state(idx_mapping, num_sampled=num_sampled)
-    torch.testing.assert_close(state.num_accepted_tokens_gpu, torch.tensor([2, 0, 4, 0], dtype=torch.int32))
+    np.testing.assert_array_equal(state._num_accepted_tokens_cpu, np.array([2, 0, 4, 0], dtype=np.int32))
 
 
 def test_310p_hybrid_model_state_initializes_full_upstream_contract() -> None:
@@ -333,69 +336,55 @@ def test_update_seq_lens_cpu_only_marks_scheduler_changed_rows() -> None:
     np.testing.assert_array_equal(runner.input_buffers.seq_lens_np, [5, 5])
 
 
-def test_post_update_310_dispatches_fused_op() -> None:
-    fused_op = MagicMock()
-    fake_ops = SimpleNamespace(_C_ascend=SimpleNamespace(post_update_310=fused_op))
-    idx_mapping = torch.tensor([1, 0], dtype=torch.int32)
-    num_computed_tokens = torch.zeros(2, dtype=torch.int32)
-    last_sampled_tokens = torch.zeros((2, 1), dtype=torch.int64)
-    output_bin_counts = torch.zeros((2, 32), dtype=torch.int32)
+def test_post_update_cpu_matches_upstream_bookkeeping() -> None:
+    idx_mapping_np = np.array([1, 0], dtype=np.int32)
+    query_start_loc_np = np.array([0, 2, 4], dtype=np.int32)
+    req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(cpu=torch.zeros((2, 8), dtype=torch.int32)),
+        last_sampled_tokens_cpu=torch.zeros((2, 1), dtype=torch.int64),
+        total_len=SimpleNamespace(np=np.zeros(2, dtype=np.int32)),
+        num_computed_tokens_np=np.zeros(2, dtype=np.int32),
+        num_computed_tokens_cpu=torch.zeros(2, dtype=torch.int32),
+        num_computed_tokens=SimpleNamespace(cpu=torch.zeros(2, dtype=torch.int32)),
+    )
     sampled_tokens = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
     num_sampled = torch.tensor([2, 1], dtype=torch.int32)
     num_rejected = torch.tensor([0, 1], dtype=torch.int32)
-    query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
-    all_token_ids = torch.zeros((2, 8), dtype=torch.int32)
-    total_len = torch.zeros(2, dtype=torch.int32)
 
-    with patch.object(model_runner_module.torch, "ops", fake_ops):
-        model_runner_module._post_update_310(
-            idx_mapping,
-            num_computed_tokens,
-            last_sampled_tokens,
-            output_bin_counts,
-            sampled_tokens,
-            num_sampled,
-            num_rejected,
-            query_start_loc,
-            all_token_ids,
-            total_len,
-        )
-
-    fused_op.assert_called_once_with(
-        idx_mapping,
-        num_computed_tokens,
-        last_sampled_tokens,
-        output_bin_counts,
+    sampled_cpu = model_runner_module._post_update_cpu(
+        idx_mapping_np,
+        query_start_loc_np,
+        req_states,
         sampled_tokens,
         num_sampled,
         num_rejected,
-        query_start_loc,
-        all_token_ids,
-        total_len,
-        True,
-        True,
     )
 
+    torch.testing.assert_close(sampled_cpu, num_sampled)
+    np.testing.assert_array_equal(req_states.total_len.np, [1, 2])
+    np.testing.assert_array_equal(req_states.num_computed_tokens_np, [1, 2])
+    torch.testing.assert_close(req_states.last_sampled_tokens_cpu[:, 0], torch.tensor([20, 11]))
+    torch.testing.assert_close(req_states.all_token_ids.cpu[1, :2], torch.tensor([10, 11]))
 
-def test_postprocess_sampled_uses_ascendc_and_syncs_mtp_state() -> None:
+
+def test_postprocess_sampled_uses_cpu_state_then_uploads_last_token() -> None:
     runner = object.__new__(NPUModelRunner310V2)
     runner.is_last_pp_rank = False
-    runner.speculator = object()
+    runner._postprocess_idx_mapping_np = np.array([1, 0], dtype=np.int32)
+    runner._postprocess_query_start_loc_np = np.array([0, 2, 4], dtype=np.int32)
     runner.req_states = SimpleNamespace(
-        num_computed_tokens=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int32)),
+        num_computed_tokens_cpu=torch.zeros(2, dtype=torch.int32),
         last_sampled_tokens=torch.zeros((2, 1), dtype=torch.int64),
-        all_token_ids=SimpleNamespace(gpu=torch.zeros((2, 8), dtype=torch.int32)),
-        total_len=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int32)),
+        last_sampled_tokens_cpu=torch.tensor([[20], [11]], dtype=torch.int64),
     )
     runner.model_state = MagicMock()
-    runner._copy_num_computed_tokens_to_cpu = MagicMock()
     idx_mapping = torch.tensor([1, 0], dtype=torch.int32)
     sampled_tokens = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
     num_sampled = torch.tensor([2, 1], dtype=torch.int32)
     num_rejected = torch.tensor([0, 1], dtype=torch.int32)
     query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
 
-    with patch.object(model_runner_module, "_post_update_310") as post_update:
+    with patch.object(model_runner_module, "_post_update_cpu", return_value=num_sampled.cpu()) as post_update:
         runner.postprocess_sampled(
             idx_mapping,
             sampled_tokens,
@@ -406,11 +395,11 @@ def test_postprocess_sampled_uses_ascendc_and_syncs_mtp_state() -> None:
 
     post_update.assert_called_once()
     runner.model_state.postprocess_state.assert_called_once_with(
-        idx_mapping,
-        num_sampled,
-        runner.req_states.num_computed_tokens.gpu,
+        torch.from_numpy(runner._postprocess_idx_mapping_np),
+        num_sampled.cpu(),
+        runner.req_states.num_computed_tokens_cpu,
     )
-    runner._copy_num_computed_tokens_to_cpu.assert_called_once_with()
+    torch.testing.assert_close(runner.req_states.last_sampled_tokens, runner.req_states.last_sampled_tokens_cpu)
 
 
 @pytest.mark.parametrize(("finished_req_ids", "sync_count"), [({"finished"}, 1), (set(), 0)])

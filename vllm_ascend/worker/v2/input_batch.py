@@ -74,6 +74,13 @@ class AscendInputBatch(InputBatch):
     # attn_state is used to build attention metadata.
     attn_state: AscendAttentionState | None = None
     is_dummy: bool = False
+    # 310P CPU-first preparation keeps gathered block tables for Mamba state
+    # decisions. Forward still consumes the device tensors returned separately.
+    block_tables_np: tuple[np.ndarray, ...] | None = None
+    # 310P sampler reuses host-prepared token rows and indices. This avoids
+    # copying draft tokens back from NPU during greedy MTP verification.
+    input_ids_cpu: torch.Tensor | None = None
+    logits_indices_np: np.ndarray | None = None
 
     @classmethod
     def make_dummy(
