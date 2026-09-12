@@ -14,4 +14,6 @@ def test_mrope_positions_use_mrv1_pinned_buffer_and_writer() -> None:
     assert "self.positions_np = self.positions_cpu.numpy()" in source
     assert "MRotaryEmbedding.get_next_input_positions_tensor(" in source
     assert "decode_positions = torch.arange(" not in source
+    assert "self.positions.copy_(self.positions_cpu, non_blocking=True)" in source
+    assert "self.positions[:, :num_tokens_after_padding].copy_(" not in source
     assert "non_blocking=True" in source
