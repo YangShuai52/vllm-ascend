@@ -115,9 +115,22 @@ class NPUModelRunner310V2(NPUModelRunner):
             vocab_size=self.vocab_size,
             device=self.device,
         )
-        self.input_ids_cpu = torch.zeros(self.max_num_tokens, dtype=torch.int32, device="cpu")
-        self.positions_cpu = torch.zeros(self.max_num_tokens, dtype=torch.int64, device="cpu")
-        self.next_prefill_tokens_cpu = torch.zeros(self.max_num_reqs, dtype=torch.int32, device="cpu")
+        pin_memory = is_pin_memory_available()
+        self.input_ids_cpu = torch.zeros(self.max_num_tokens, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
+        self.positions_cpu = torch.zeros(self.max_num_tokens, dtype=torch.int64, device="cpu", pin_memory=pin_memory)
+        self.next_prefill_tokens_cpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device="cpu", pin_memory=pin_memory
+        )
+        self._decode_req_indices_cpu = torch.empty(
+            self.max_num_reqs, dtype=torch.int64, device="cpu", pin_memory=pin_memory
+        )
+        self._decode_input_indices_cpu = torch.empty(
+            self.max_num_reqs, dtype=torch.int64, device="cpu", pin_memory=pin_memory
+        )
+        self._decode_req_indices_np = self._decode_req_indices_cpu.numpy()
+        self._decode_input_indices_np = self._decode_input_indices_cpu.numpy()
+        self._decode_req_indices_gpu = torch.empty(self.max_num_reqs, dtype=torch.int64, device=self.device)
+        self._decode_input_indices_gpu = torch.empty(self.max_num_reqs, dtype=torch.int64, device=self.device)
         # PrefillCacheHit / ChunkedPrefill must not replay FULL mixed ACLGraphs
         # (same as MRv1 `_determine_batch_execution_and_padding`). FULL_DECODE_ONLY
         # already keeps those batches eager via mixed_mode=NONE.
@@ -277,6 +290,7 @@ class NPUModelRunner310V2(NPUModelRunner):
         batch_has_prefill = bool(np.any(is_prefilling_np))
         self.eplb.set_batch_phase(batch_has_prefill)
         self._prepare_token_inputs_cpu(
+            idx_mapping,
             idx_mapping_np,
             query_start_loc_np,
             prefill_len_np,
@@ -988,6 +1002,7 @@ class NPUModelRunner310V2(NPUModelRunner):
 
     def _prepare_token_inputs_cpu(
         self,
+        idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
         query_start_loc_np: np.ndarray,
         prefill_len_np: np.ndarray,
@@ -1001,6 +1016,8 @@ class NPUModelRunner310V2(NPUModelRunner):
         self.next_prefill_tokens_cpu.zero_()
         decode_req_indices: list[int] = []
         decode_input_indices: list[int] = []
+        needs_host_copy = False
+        has_prefill = False
         for batch_idx, req_idx_value in enumerate(idx_mapping_np):
             req_idx = int(req_idx_value)
             start = int(query_start_loc_np[batch_idx])
@@ -1008,6 +1025,8 @@ class NPUModelRunner310V2(NPUModelRunner):
             num_computed = int(self.req_states.num_computed_tokens_np[req_idx])
             prefill_len = int(prefill_len_np[batch_idx])
             if num_computed < prefill_len:
+                needs_host_copy = True
+                has_prefill = True
                 self.input_ids_cpu[start:end].copy_(
                     self.req_states.all_token_ids.cpu[req_idx, num_computed : num_computed + end - start]
                 )
@@ -1021,24 +1040,45 @@ class NPUModelRunner310V2(NPUModelRunner):
                 decode_input_indices.append(start)
             drafts = draft_tokens_map.get(req_ids[batch_idx], ())
             if drafts:
+                needs_host_copy = True
                 draft_count = min(len(drafts), end - start - 1)
                 self.input_ids_cpu[start + 1 : start + 1 + draft_count] = torch.tensor(
                     drafts[:draft_count], dtype=self.input_ids_cpu.dtype
                 )
 
-        self.input_buffers.input_ids[:num_tokens_after_padding].copy_(
-            self.input_ids_cpu[:num_tokens_after_padding], non_blocking=True
-        )
+        if needs_host_copy:
+            self.input_buffers.input_ids[:num_tokens_after_padding].copy_(
+                self.input_ids_cpu[:num_tokens_after_padding], non_blocking=True
+            )
         if decode_req_indices:
-            req_indices = async_copy_to_gpu(np.asarray(decode_req_indices, dtype=np.int64), device=self.device)
-            input_indices = async_copy_to_gpu(np.asarray(decode_input_indices, dtype=np.int64), device=self.device)
+            num_decode_reqs = len(decode_req_indices)
+            pure_decode = (
+                not needs_host_copy
+                and num_decode_reqs == idx_mapping_np.size
+                and np.all(np.diff(query_start_loc_np[: num_decode_reqs + 1]) == 1)
+            )
+            if pure_decode:
+                decode_tokens = self.req_states.last_sampled_tokens.index_select(
+                    0, idx_mapping.to(torch.int64)
+                ).squeeze(1)
+                self.input_buffers.input_ids[:num_decode_reqs].copy_(
+                    decode_tokens.to(self.input_buffers.input_ids.dtype)
+                )
+                return
+            self._decode_req_indices_np[:num_decode_reqs] = decode_req_indices
+            self._decode_input_indices_np[:num_decode_reqs] = decode_input_indices
+            req_indices = self._decode_req_indices_gpu[:num_decode_reqs]
+            input_indices = self._decode_input_indices_gpu[:num_decode_reqs]
+            req_indices.copy_(self._decode_req_indices_cpu[:num_decode_reqs], non_blocking=True)
+            input_indices.copy_(self._decode_input_indices_cpu[:num_decode_reqs], non_blocking=True)
             decode_tokens = self.req_states.last_sampled_tokens.index_select(0, req_indices).squeeze(1)
             self.input_buffers.input_ids.index_copy_(
                 0,
                 input_indices,
                 decode_tokens.to(self.input_buffers.input_ids.dtype),
             )
-        self.req_states.next_prefill_tokens.copy_(self.next_prefill_tokens_cpu, non_blocking=True)
+        if has_prefill:
+            self.req_states.next_prefill_tokens.copy_(self.next_prefill_tokens_cpu, non_blocking=True)
 
     def _prepare_pos_seq_lens(
         self,
@@ -1192,22 +1232,37 @@ class NPUModelRunner310V2(NPUModelRunner):
         # prefill rows have num_sampled=0 and must not overwrite prior state.
         valid_batch_np = np.flatnonzero(self._num_sampled_cpu.numpy() > 0)
         if valid_batch_np.size:
-            valid_batch = async_copy_to_gpu(valid_batch_np.astype(np.int64), device=self.device)
-            valid_reqs = async_copy_to_gpu(
-                self._postprocess_idx_mapping_np[valid_batch_np].astype(np.int64),
-                device=self.device,
-            )
-            if sampled_tokens_cpu is None:
-                last_tokens = sampled_tokens.index_select(0, valid_batch)[:, 0]
+            all_rows_valid = sampled_tokens_cpu is None and valid_batch_np.size == self._postprocess_idx_mapping_np.size
+            if all_rows_valid:
+                # Pure decode: reuse device idx_mapping. No index H2D or gather.
+                valid_reqs = idx_mapping.to(torch.int64)
+                last_tokens = sampled_tokens[:, 0]
             else:
-                last_tokens_cpu = torch.stack(
-                    [
-                        sampled_tokens_cpu[batch_idx, int(self._num_sampled_cpu[batch_idx]) - 1]
-                        for batch_idx in valid_batch_np
-                    ]
-                ).to(torch.int64)
-                last_tokens = last_tokens_cpu.to(self.device, non_blocking=True)
-            self.req_states.last_sampled_tokens.index_copy_(0, valid_reqs, last_tokens.view(-1, 1))
+                num_valid = valid_batch_np.size
+                self._decode_input_indices_np[:num_valid] = valid_batch_np
+                self._decode_req_indices_np[:num_valid] = self._postprocess_idx_mapping_np[valid_batch_np]
+                valid_batch = self._decode_input_indices_gpu[:num_valid]
+                valid_reqs = self._decode_req_indices_gpu[:num_valid]
+                valid_batch.copy_(self._decode_input_indices_cpu[:num_valid], non_blocking=True)
+                valid_reqs.copy_(self._decode_req_indices_cpu[:num_valid], non_blocking=True)
+                if sampled_tokens_cpu is None:
+                    last_tokens = sampled_tokens.index_select(0, valid_batch)[:, 0]
+                else:
+                    last_tokens_cpu = torch.stack(
+                        [
+                            sampled_tokens_cpu[
+                                batch_idx,
+                                int(self._num_sampled_cpu[batch_idx]) - 1,
+                            ]
+                            for batch_idx in valid_batch_np
+                        ]
+                    ).to(torch.int64)
+                    last_tokens = last_tokens_cpu.to(self.device, non_blocking=True)
+            self.req_states.last_sampled_tokens.index_copy_(
+                0,
+                valid_reqs,
+                last_tokens.to(self.req_states.last_sampled_tokens.dtype).view(-1, 1),
+            )
         self.model_state.postprocess_state(
             torch.from_numpy(self._postprocess_idx_mapping_np),
             num_sampled_cpu,

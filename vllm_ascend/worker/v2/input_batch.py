@@ -20,6 +20,7 @@ from dataclasses import dataclass, fields
 
 import numpy as np
 import torch
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -56,6 +57,7 @@ class AscendInputBuffers(InputBuffers):
             max_num_reqs,
             dtype=torch.int32,
             device="cpu",
+            pin_memory=is_pin_memory_available(),
         )
         # seq_len_np and seq_lens_cpu share the same memory.
         # define seq_lens_np for easier calculation with numpy.

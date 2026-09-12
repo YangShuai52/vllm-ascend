@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
 
@@ -53,15 +54,25 @@ class Ascend310PBlockTables(BlockTables):
             (max_num_reqs, max_num_blocks * blocks_per_kv_block)
             for max_num_blocks, blocks_per_kv_block in zip(max_num_blocks_per_group, self.blocks_per_kv_block)
         ]
-        self.block_tables_cpu = [np.zeros(shape, dtype=np.int32) for shape in table_shapes]
-        self.input_block_tables_cpu = [np.zeros(shape, dtype=np.int32) for shape in table_shapes]
+        pin_memory = is_pin_memory_available()
+        self._block_tables_cpu_tensors = [
+            torch.zeros(shape, dtype=torch.int32, device="cpu", pin_memory=pin_memory) for shape in table_shapes
+        ]
+        self._input_block_tables_cpu_tensors = [
+            torch.zeros(shape, dtype=torch.int32, device="cpu", pin_memory=pin_memory) for shape in table_shapes
+        ]
+        self.block_tables_cpu = [tensor.numpy() for tensor in self._block_tables_cpu_tensors]
+        self.input_block_tables_cpu = [tensor.numpy() for tensor in self._input_block_tables_cpu_tensors]
         self.input_block_tables = [torch.zeros(shape, dtype=torch.int32, device=device) for shape in table_shapes]
         self.num_blocks_np = np.zeros((self.num_kv_cache_groups, max_num_reqs), dtype=np.int32)
-        self.slot_mappings_cpu = np.full(
+        self._slot_mappings_cpu_tensor = torch.full(
             (self.num_kv_cache_groups, max_num_batched_tokens),
             PAD_SLOT_ID,
-            dtype=np.int32,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=pin_memory,
         )
+        self.slot_mappings_cpu = self._slot_mappings_cpu_tensor.numpy()
         # Persistent device buffers are reused by eager execution and ACLGraph.
         self.slot_mappings = torch.full(
             self.slot_mappings_cpu.shape,
@@ -115,10 +126,11 @@ class Ascend310PBlockTables(BlockTables):
         if num_reqs_padded < num_reqs:
             raise ValueError(f"num_reqs_padded ({num_reqs_padded}) is smaller than num_reqs ({num_reqs}).")
 
-        for group_id, (source, host_output, device_output) in enumerate(
+        for group_id, (source, host_output, host_tensor, device_output) in enumerate(
             zip(
                 self.block_tables_cpu,
                 self.input_block_tables_cpu,
+                self._input_block_tables_cpu_tensors,
                 self.input_block_tables,
             )
         ):
@@ -126,7 +138,7 @@ class Ascend310PBlockTables(BlockTables):
             for batch_idx, req_idx in enumerate(idx_mapping_np):
                 num_blocks = int(self.num_blocks_np[group_id, req_idx])
                 host_output[batch_idx, :num_blocks] = source[req_idx, :num_blocks]
-            device_output[:num_reqs_padded].copy_(torch.from_numpy(host_output[:num_reqs_padded]), non_blocking=True)
+            device_output[:num_reqs_padded].copy_(host_tensor[:num_reqs_padded], non_blocking=True)
 
         return tuple(table[:num_reqs_padded] for table in self.input_block_tables)
 
@@ -156,7 +168,7 @@ class Ascend310PBlockTables(BlockTables):
                 self.slot_mappings_cpu[group_id, start:end] = block_numbers * block_size + block_offsets
 
         device_slots = self.slot_mappings if out is None else out
-        device_slots.copy_(torch.from_numpy(self.slot_mappings_cpu), non_blocking=True)
+        device_slots.copy_(self._slot_mappings_cpu_tensor, non_blocking=True)
         return device_slots[:, :num_tokens_padded]
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
