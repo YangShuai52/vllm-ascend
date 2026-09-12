@@ -537,10 +537,6 @@ class NPUModelRunner310V2(NPUModelRunner):
         is_profile: bool = False,
         context_len: int = 0,
     ):
-        # Non-MTP sampled-token D2H was launched on the previous iteration's
-        # side stream. Consume it before request slots can be removed/reused by
-        # super().execute_model(). Steady-state event wait is normally ready.
-        self._flush_pending_sampled_tokens_cpu()
         self._force_eager_pc_batch = False
         self._force_eager_spec_batch = False
         if not dummy_run:
@@ -999,10 +995,12 @@ class NPUModelRunner310V2(NPUModelRunner):
         req_ids: list[str],
         num_tokens_after_padding: int,
     ) -> None:
-        """Build prefill/decode/MTP token input on CPU, then issue one H2D."""
+        """Build host-owned inputs, then patch decode tokens from NPU state."""
         draft_tokens_map = draft_tokens_map or {}
         self.input_ids_cpu[:num_tokens_after_padding].zero_()
         self.next_prefill_tokens_cpu.zero_()
+        decode_req_indices: list[int] = []
+        decode_input_indices: list[int] = []
         for batch_idx, req_idx_value in enumerate(idx_mapping_np):
             req_idx = int(req_idx_value)
             start = int(query_start_loc_np[batch_idx])
@@ -1019,7 +1017,8 @@ class NPUModelRunner310V2(NPUModelRunner):
                 continue
 
             if end > start:
-                self.input_ids_cpu[start] = self.req_states.last_sampled_tokens_cpu[req_idx, 0]
+                decode_req_indices.append(req_idx)
+                decode_input_indices.append(start)
             drafts = draft_tokens_map.get(req_ids[batch_idx], ())
             if drafts:
                 draft_count = min(len(drafts), end - start - 1)
@@ -1030,6 +1029,15 @@ class NPUModelRunner310V2(NPUModelRunner):
         self.input_buffers.input_ids[:num_tokens_after_padding].copy_(
             self.input_ids_cpu[:num_tokens_after_padding], non_blocking=True
         )
+        if decode_req_indices:
+            req_indices = async_copy_to_gpu(np.asarray(decode_req_indices, dtype=np.int64), device=self.device)
+            input_indices = async_copy_to_gpu(np.asarray(decode_input_indices, dtype=np.int64), device=self.device)
+            decode_tokens = self.req_states.last_sampled_tokens.index_select(0, req_indices).squeeze(1)
+            self.input_buffers.input_ids.index_copy_(
+                0,
+                input_indices,
+                decode_tokens.to(self.input_buffers.input_ids.dtype),
+            )
         self.req_states.next_prefill_tokens.copy_(self.next_prefill_tokens_cpu, non_blocking=True)
 
     def _prepare_pos_seq_lens(
@@ -1175,53 +1183,36 @@ class NPUModelRunner310V2(NPUModelRunner):
             self._postprocess_idx_mapping_np,
             self._postprocess_query_start_loc_np,
             self.req_states,
-            (self.sampler.sampled_tokens_cpu if sampled_tokens_cpu is None else sampled_tokens_cpu),
+            sampled_tokens if sampled_tokens_cpu is None else sampled_tokens_cpu,
             self._num_sampled_cpu,
             self._num_rejected_cpu,
             update_tokens=sampled_tokens_cpu is not None,
         )
-        if sampled_tokens_cpu is None:
-            self._pending_sampled_cpu_update = (
-                self._postprocess_idx_mapping_np.copy(),
-                self._num_sampled_cpu.clone(),
+        # MRV1 ownership: sampled tokens remain device-resident. Chunked
+        # prefill rows have num_sampled=0 and must not overwrite prior state.
+        valid_batch_np = np.flatnonzero(self._num_sampled_cpu.numpy() > 0)
+        if valid_batch_np.size:
+            valid_batch = async_copy_to_gpu(valid_batch_np.astype(np.int64), device=self.device)
+            valid_reqs = async_copy_to_gpu(
+                self._postprocess_idx_mapping_np[valid_batch_np].astype(np.int64),
+                device=self.device,
             )
-        # MTP proposer consumes last_sampled immediately. For non-rejection
-        # steps keep this dependency on NPU: one batched index_copy is much
-        # cheaper than synchronizing the side-stream D2H here.
-        if self.speculator is not None:
             if sampled_tokens_cpu is None:
-                self.req_states.last_sampled_tokens.index_copy_(
-                    0,
-                    idx_mapping.long(),
-                    sampled_tokens[:, :1].to(self.req_states.last_sampled_tokens.dtype),
-                )
+                last_tokens = sampled_tokens.index_select(0, valid_batch)[:, 0]
             else:
-                self.req_states.last_sampled_tokens.copy_(
-                    self.req_states.last_sampled_tokens_cpu,
-                    non_blocking=True,
-                )
+                last_tokens_cpu = torch.stack(
+                    [
+                        sampled_tokens_cpu[batch_idx, int(self._num_sampled_cpu[batch_idx]) - 1]
+                        for batch_idx in valid_batch_np
+                    ]
+                ).to(torch.int64)
+                last_tokens = last_tokens_cpu.to(self.device, non_blocking=True)
+            self.req_states.last_sampled_tokens.index_copy_(0, valid_reqs, last_tokens.view(-1, 1))
         self.model_state.postprocess_state(
             torch.from_numpy(self._postprocess_idx_mapping_np),
             num_sampled_cpu,
             self.req_states.num_computed_tokens_cpu,
         )
-
-    def _flush_pending_sampled_tokens_cpu(self) -> None:
-        pending = getattr(self, "_pending_sampled_cpu_update", None)
-        if pending is None:
-            return
-        self.sampler.synchronize_sampled_tokens_cpu()
-        idx_mapping_np, num_sampled_cpu = pending
-        _post_update_cpu(
-            idx_mapping_np,
-            None,
-            self.req_states,
-            self.sampler.sampled_tokens_cpu,
-            num_sampled_cpu,
-            torch.zeros_like(num_sampled_cpu),
-            update_computed=False,
-        )
-        self._pending_sampled_cpu_update = None
 
     def _update_seq_lens_cpu(
         self,

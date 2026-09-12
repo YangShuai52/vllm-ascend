@@ -144,6 +144,7 @@ def test_init_model_state_routes_qwen35_hybrid_to_310p() -> None:
 def test_get_kv_cache_spec_restores_qwen35_linear_attn() -> None:
     """Qwen3.5 GDN layers may be omitted by upstream V2; 310P restores them."""
     runner = object.__new__(NPUModelRunner310V2)
+    runner.device = torch.device("cpu")
     runner.vllm_config = object()
     restored = object()
     linear_layer = SimpleNamespace(get_kv_cache_spec=lambda _cfg: restored)
@@ -367,8 +368,9 @@ def test_post_update_cpu_matches_upstream_bookkeeping() -> None:
     torch.testing.assert_close(req_states.all_token_ids.cpu[1, :2], torch.tensor([10, 11]))
 
 
-def test_postprocess_sampled_uses_cpu_state_then_uploads_last_token() -> None:
+def test_postprocess_sampled_keeps_last_token_on_device() -> None:
     runner = object.__new__(NPUModelRunner310V2)
+    runner.device = torch.device("cpu")
     runner.is_last_pp_rank = False
     runner._postprocess_idx_mapping_np = np.array([1, 0], dtype=np.int32)
     runner._postprocess_query_start_loc_np = np.array([0, 2, 4], dtype=np.int32)
@@ -378,11 +380,15 @@ def test_postprocess_sampled_uses_cpu_state_then_uploads_last_token() -> None:
         last_sampled_tokens_cpu=torch.tensor([[20], [11]], dtype=torch.int64),
     )
     runner.model_state = MagicMock()
+    runner.speculator = object()
     idx_mapping = torch.tensor([1, 0], dtype=torch.int32)
     sampled_tokens = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
     num_sampled = torch.tensor([2, 1], dtype=torch.int32)
     num_rejected = torch.tensor([0, 1], dtype=torch.int32)
     query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+    runner._sampled_tokens_cpu = sampled_tokens
+    runner._num_sampled_cpu = num_sampled
+    runner._num_rejected_cpu = num_rejected
 
     with patch.object(model_runner_module, "_post_update_cpu", return_value=num_sampled.cpu()) as post_update:
         runner.postprocess_sampled(
@@ -400,6 +406,19 @@ def test_postprocess_sampled_uses_cpu_state_then_uploads_last_token() -> None:
         runner.req_states.num_computed_tokens_cpu,
     )
     torch.testing.assert_close(runner.req_states.last_sampled_tokens, runner.req_states.last_sampled_tokens_cpu)
+
+
+def test_sampler_does_not_copy_sampled_tokens_to_cpu() -> None:
+    sampler = Ascend310PSampler(device="cpu")
+    input_batch = SimpleNamespace(
+        seq_lens=torch.ones(2, dtype=torch.int32),
+        num_reqs=2,
+    )
+
+    output = sampler(torch.tensor([[0.0, 1.0], [2.0, 0.0]]), input_batch)
+
+    torch.testing.assert_close(output.sampled_token_ids, torch.tensor([[1], [0]], dtype=torch.int32))
+    assert not hasattr(sampler, "sampled_tokens_cpu")
 
 
 @pytest.mark.parametrize(("finished_req_ids", "sync_count"), [({"finished"}, 1), (set(), 0)])

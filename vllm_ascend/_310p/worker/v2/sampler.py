@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 
@@ -39,17 +38,6 @@ class Ascend310PSampler:
         self.temperature_cpu = torch.zeros(max_num_reqs, dtype=torch.float32, device="cpu")
         self.seeds_cpu = torch.zeros(max_num_reqs, dtype=torch.int64, device="cpu")
         self._sampling_state_dirty = False
-        self.sampled_tokens_cpu = torch.empty(
-            (max_num_reqs, 1),
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=is_pin_memory_available(),
-        )
-        self._sampled_copy_stream = None
-        self._sampled_copy_event = None
-        if device.type == "npu":
-            self._sampled_copy_stream = torch.npu.Stream()
-            self._sampled_copy_event = torch.npu.Event()
         self.sampling_states = SimpleNamespace(
             temperature=SimpleNamespace(gpu=temperature_gpu),
             seeds=SimpleNamespace(gpu=seeds_gpu),
@@ -107,16 +95,6 @@ class Ascend310PSampler:
         sampled = logits.argmax(dim=-1).to(torch.int32)
         num_sampled = input_batch.seq_lens.new_ones(input_batch.num_reqs)
         sampled_2d = sampled.view(-1, 1)
-        if self._sampled_copy_stream is None:
-            self.sampled_tokens_cpu[: sampled_2d.shape[0]].copy_(sampled_2d)
-        else:
-            # Match MRV1 AsyncOutput: enqueue D2H on a side stream. CPU
-            # bookkeeping consumes it at the beginning of the next execute.
-            default_stream = torch.npu.current_stream(device=self.device)
-            with torch.npu.stream(self._sampled_copy_stream):
-                self._sampled_copy_stream.wait_stream(default_stream)
-                self.sampled_tokens_cpu[: sampled_2d.shape[0]].copy_(sampled_2d, non_blocking=True)
-                self._sampled_copy_event.record()
         return SamplerOutput(
             sampled_token_ids=sampled_2d,
             logprobs_tensors=None,
@@ -124,7 +102,3 @@ class Ascend310PSampler:
             num_sampled=num_sampled,
             num_rejected=torch.zeros_like(num_sampled),
         )
-
-    def synchronize_sampled_tokens_cpu(self) -> None:
-        if self._sampled_copy_event is not None:
-            self._sampled_copy_event.synchronize()
