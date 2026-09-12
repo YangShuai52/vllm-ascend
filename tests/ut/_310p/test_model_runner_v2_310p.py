@@ -110,6 +110,25 @@ def test_kv_zeroing_matches_mrv1_gate(
     assert runner._needs_kv_cache_zeroing_310p(kv_cache_config) is expected
 
 
+def test_update_requests_filters_unneeded_upstream_zeroing() -> None:
+    runner = object.__new__(NPUModelRunner310V2)
+    runner.speculative_config = None
+    runner.kv_cache_config = SimpleNamespace(
+        has_mamba_layers=True,
+        kv_cache_groups=[SimpleNamespace(is_eagle_group=False)],
+    )
+    scheduler_output = SimpleNamespace(
+        kv_cache_block_copies=None,
+        new_block_ids_to_zero=[1, 2, 3],
+    )
+
+    with patch.object(NPUModelRunner, "update_requests") as update_requests:
+        runner.update_requests(scheduler_output)
+
+    assert scheduler_output.new_block_ids_to_zero is None
+    update_requests.assert_called_once_with(scheduler_output)
+
+
 def test_config_accepts_qwen3_vl_multimodal_mrope() -> None:
     """Qwen3-VL is multimodal + MRoPE; 310P MRv2 must allow it."""
     config = _make_vllm_config()

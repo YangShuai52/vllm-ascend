@@ -693,6 +693,13 @@ class NPUModelRunner310V2(NPUModelRunner):
         pending_copies: list[KVCacheBlockCopy] | None = None
         if copies:
             pending_copies = self._dedupe_kv_cache_block_copies(copies)
+        # Main derives this field from KVCacheConfig.has_mamba_layers, which is
+        # broader than the MRV1 310P requirement. Filter at the actual consumer
+        # before GPUModelRunner.update_requests invokes the zeroer.
+        if scheduler_output.new_block_ids_to_zero and not self._needs_kv_cache_zeroing_310p(
+            self.kv_cache_config
+        ):
+            scheduler_output.new_block_ids_to_zero = None
         # Skip upstream copy (mishandles 310P NZ attention storages).
         scheduler_output.kv_cache_block_copies = None
         super().update_requests(scheduler_output)
@@ -843,6 +850,7 @@ class NPUModelRunner310V2(NPUModelRunner):
             runner_only_attn_layers=getattr(self, "runner_only_attn_layers", set()),
             static_forward_context=self.compilation_config.static_forward_context,
         )
+        self.kv_block_zeroer.enabled = self._needs_kv_cache_zeroing_310p(self.kv_cache_config)
 
     def _allocate_kv_cache_tensors(
         self,
