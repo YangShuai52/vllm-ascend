@@ -449,12 +449,12 @@ def test_postprocess_sampled_keeps_last_token_on_device() -> None:
     )
     runner.model_state = MagicMock()
     runner.speculator = object()
-    runner._decode_req_indices_cpu = torch.empty(2, dtype=torch.int64)
-    runner._decode_input_indices_cpu = torch.empty(2, dtype=torch.int64)
-    runner._decode_req_indices_np = runner._decode_req_indices_cpu.numpy()
-    runner._decode_input_indices_np = runner._decode_input_indices_cpu.numpy()
-    runner._decode_req_indices_gpu = torch.empty(2, dtype=torch.int64)
-    runner._decode_input_indices_gpu = torch.empty(2, dtype=torch.int64)
+    runner._decode_req_indices = model_runner_module.CpuGpuBuffer(
+        2, dtype=torch.int64, device=runner.device, pin_memory=False
+    )
+    runner._decode_input_indices = model_runner_module.CpuGpuBuffer(
+        2, dtype=torch.int64, device=runner.device, pin_memory=False
+    )
     idx_mapping = torch.tensor([1, 0], dtype=torch.int32)
     sampled_tokens = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
     num_sampled = torch.tensor([2, 1], dtype=torch.int32)
