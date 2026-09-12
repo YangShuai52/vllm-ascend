@@ -63,6 +63,9 @@ def _post_update_cpu(
     sampled_cpu: torch.Tensor,
     num_sampled_cpu: torch.Tensor,
     num_rejected_cpu: torch.Tensor,
+    *,
+    update_tokens: bool = True,
+    update_computed: bool = True,
 ) -> torch.Tensor:
     """Run upstream ``post_update`` from sampler-owned CPU results."""
     for batch_idx, req_idx_value in enumerate(idx_mapping_np):
@@ -71,11 +74,13 @@ def _post_update_cpu(
             continue
         count = int(num_sampled_cpu[batch_idx])
         total_len = int(req_states.total_len.np[req_idx])
-        if count > 0:
+        if update_tokens and count > 0:
             tokens = sampled_cpu[batch_idx, :count].to(dtype=req_states.all_token_ids.cpu.dtype)
             req_states.all_token_ids.cpu[req_idx, total_len : total_len + count].copy_(tokens)
             req_states.last_sampled_tokens_cpu[req_idx, 0] = tokens[-1]
             req_states.total_len.np[req_idx] = total_len + count
+        if not update_computed:
+            continue
         query_len = (
             0 if query_start_loc_np is None else int(query_start_loc_np[batch_idx + 1] - query_start_loc_np[batch_idx])
         )
@@ -532,6 +537,10 @@ class NPUModelRunner310V2(NPUModelRunner):
         is_profile: bool = False,
         context_len: int = 0,
     ):
+        # Non-MTP sampled-token D2H was launched on the previous iteration's
+        # side stream. Consume it before request slots can be removed/reused by
+        # super().execute_model(). Steady-state event wait is normally ready.
+        self._flush_pending_sampled_tokens_cpu()
         self._force_eager_pc_batch = False
         self._force_eager_spec_batch = False
         if not dummy_run:
@@ -1129,7 +1138,7 @@ class NPUModelRunner310V2(NPUModelRunner):
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             sampler_output = self.sampler(logits, input_batch)
             can_sample_np = input_batch.seq_lens_np[: input_batch.num_reqs] >= input_batch.prefill_len_np
-            self._sampled_tokens_cpu = self.sampler.sampled_tokens_cpu
+            self._sampled_tokens_cpu = None
             self._num_sampled_cpu = torch.from_numpy(can_sample_np.astype(np.int32))
             self._num_rejected_cpu = torch.zeros_like(self._num_sampled_cpu)
             num_sampled = async_copy_to_gpu(can_sample_np.astype(np.int32), device=self.device)
@@ -1160,25 +1169,59 @@ class NPUModelRunner310V2(NPUModelRunner):
         """Run request bookkeeping on CPU; upload only immediate NPU consumers."""
         # CPU mirrors were produced during sampling. Device arguments remain in
         # the upstream signature for MTP proposer/output compatibility.
-        del idx_mapping, sampled_tokens, num_sampled, num_rejected, query_start_loc
+        del num_sampled, num_rejected, query_start_loc
+        sampled_tokens_cpu = self._sampled_tokens_cpu
         num_sampled_cpu = _post_update_cpu(
             self._postprocess_idx_mapping_np,
             self._postprocess_query_start_loc_np,
             self.req_states,
-            self._sampled_tokens_cpu,
+            (self.sampler.sampled_tokens_cpu if sampled_tokens_cpu is None else sampled_tokens_cpu),
             self._num_sampled_cpu,
             self._num_rejected_cpu,
+            update_tokens=sampled_tokens_cpu is not None,
         )
-        # MTP proposer consumes last_sampled immediately after this method.
-        self.req_states.last_sampled_tokens.copy_(
-            self.req_states.last_sampled_tokens_cpu,
-            non_blocking=True,
-        )
+        if sampled_tokens_cpu is None:
+            self._pending_sampled_cpu_update = (
+                self._postprocess_idx_mapping_np.copy(),
+                self._num_sampled_cpu.clone(),
+            )
+        # MTP proposer consumes last_sampled immediately. For non-rejection
+        # steps keep this dependency on NPU: one batched index_copy is much
+        # cheaper than synchronizing the side-stream D2H here.
+        if self.speculator is not None:
+            if sampled_tokens_cpu is None:
+                self.req_states.last_sampled_tokens.index_copy_(
+                    0,
+                    idx_mapping.long(),
+                    sampled_tokens[:, :1].to(self.req_states.last_sampled_tokens.dtype),
+                )
+            else:
+                self.req_states.last_sampled_tokens.copy_(
+                    self.req_states.last_sampled_tokens_cpu,
+                    non_blocking=True,
+                )
         self.model_state.postprocess_state(
             torch.from_numpy(self._postprocess_idx_mapping_np),
             num_sampled_cpu,
             self.req_states.num_computed_tokens_cpu,
         )
+
+    def _flush_pending_sampled_tokens_cpu(self) -> None:
+        pending = getattr(self, "_pending_sampled_cpu_update", None)
+        if pending is None:
+            return
+        self.sampler.synchronize_sampled_tokens_cpu()
+        idx_mapping_np, num_sampled_cpu = pending
+        _post_update_cpu(
+            idx_mapping_np,
+            None,
+            self.req_states,
+            self.sampler.sampled_tokens_cpu,
+            num_sampled_cpu,
+            torch.zeros_like(num_sampled_cpu),
+            update_computed=False,
+        )
+        self._pending_sampled_cpu_update = None
 
     def _update_seq_lens_cpu(
         self,
