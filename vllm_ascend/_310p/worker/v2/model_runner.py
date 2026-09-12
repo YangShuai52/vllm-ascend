@@ -793,8 +793,20 @@ class NPUModelRunner310V2(NPUModelRunner):
         )
         if kv_cache_config.needs_kv_cache_zeroing:
             self._init_kv_zero_meta()
+            self.kv_block_zeroer.enabled = self._needs_kv_cache_zeroing_310p(kv_cache_config)
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
         self._install_pc_eager_cudagraph_dispatch()
+
+    def _needs_kv_cache_zeroing_310p(self, kv_cache_config: KVCacheConfig) -> bool:
+        """Match the MRV1 zeroing gate instead of main's broad Mamba gate."""
+        spec_config = self.speculative_config
+        has_eagle_group = any(group.is_eagle_group for group in kv_cache_config.kv_cache_groups)
+        return bool(
+            kv_cache_config.has_mamba_layers
+            and has_eagle_group
+            and spec_config is not None
+            and spec_config.num_speculative_tokens > 1
+        )
 
     def _adjust_kernel_block_sizes(self, kv_cache_config: KVCacheConfig) -> None:
         for group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):

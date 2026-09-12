@@ -82,6 +82,34 @@ def test_config_accepts_tensor_parallelism() -> None:
     NPUModelRunner310V2._validate_config(_make_vllm_config())
 
 
+@pytest.mark.parametrize(
+    ("has_mamba", "has_eagle", "num_spec_tokens", "expected"),
+    [
+        (True, True, 2, True),
+        (True, True, 1, False),
+        (True, False, 2, False),
+        (False, True, 2, False),
+        (True, True, 0, False),
+    ],
+)
+def test_kv_zeroing_matches_mrv1_gate(
+    has_mamba: bool,
+    has_eagle: bool,
+    num_spec_tokens: int,
+    expected: bool,
+) -> None:
+    runner = object.__new__(NPUModelRunner310V2)
+    runner.speculative_config = (
+        SimpleNamespace(num_speculative_tokens=num_spec_tokens) if num_spec_tokens else None
+    )
+    kv_cache_config = SimpleNamespace(
+        has_mamba_layers=has_mamba,
+        kv_cache_groups=[SimpleNamespace(is_eagle_group=has_eagle)],
+    )
+
+    assert runner._needs_kv_cache_zeroing_310p(kv_cache_config) is expected
+
+
 def test_config_accepts_qwen3_vl_multimodal_mrope() -> None:
     """Qwen3-VL is multimodal + MRoPE; 310P MRv2 must allow it."""
     config = _make_vllm_config()
