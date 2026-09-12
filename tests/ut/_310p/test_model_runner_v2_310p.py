@@ -19,10 +19,31 @@ from vllm_ascend._310p.worker.v2.model_state import (
     Ascend310PModelState,
 )
 from vllm_ascend._310p.worker.v2.sampler import Ascend310PSampler
+from vllm_ascend._310p.worker.v2.spec_utils import expand_idx_mapping_cpu
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
+
+
+def test_expand_idx_mapping_uses_caller_owned_cpu_buffers() -> None:
+    idx_mapping = np.array([5, 2, 7], dtype=np.int32)
+    cu_num_logits = np.array([0, 1, 4, 6], dtype=np.int32)
+    expanded_mapping = np.full(8, -1, dtype=np.int32)
+    expanded_local_pos = np.full(8, -1, dtype=np.int32)
+
+    expand_idx_mapping_cpu(
+        idx_mapping,
+        6,
+        cu_num_logits,
+        expanded_mapping,
+        expanded_local_pos,
+    )
+
+    np.testing.assert_array_equal(expanded_mapping[:6], [5, 2, 2, 2, 7, 7])
+    np.testing.assert_array_equal(expanded_local_pos[:6], [0, 0, 1, 2, 0, 1])
+    np.testing.assert_array_equal(expanded_mapping[6:], [-1, -1])
+    np.testing.assert_array_equal(expanded_local_pos[6:], [-1, -1])
 
 
 def _make_vllm_config(**overrides):

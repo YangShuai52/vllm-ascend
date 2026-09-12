@@ -31,7 +31,6 @@ from vllm.v1.worker.gpu.attn_utils import (
     get_shared_kv_cache_layers,
     init_attn_backend,
 )
-from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.kv_connector import get_kv_connector
 from vllm.v1.worker.gpu.model_runner import BatchReqState, sort_batch_req_ids
@@ -131,6 +130,47 @@ class NPUModelRunner310V2(NPUModelRunner):
         self._decode_input_indices_np = self._decode_input_indices_cpu.numpy()
         self._decode_req_indices_gpu = torch.empty(self.max_num_reqs, dtype=torch.int64, device=self.device)
         self._decode_input_indices_gpu = torch.empty(self.max_num_reqs, dtype=torch.int64, device=self.device)
+        # Match MRV1 CpuGpuBuffer ownership: hot-path metadata has stable,
+        # reusable pinned host and device storage. This avoids allocating and
+        # pinning temporary tensors for every scheduler step.
+        self._idx_mapping_cpu = torch.empty(
+            self.max_num_reqs, dtype=torch.int32, device="cpu", pin_memory=pin_memory
+        )
+        self._idx_mapping_gpu = torch.empty(self.max_num_reqs, dtype=torch.int32, device=self.device)
+        self._cu_num_logits_cpu = torch.empty(
+            self.max_num_reqs + 1, dtype=torch.int32, device="cpu", pin_memory=pin_memory
+        )
+        self._cu_num_logits_gpu = torch.empty(self.max_num_reqs + 1, dtype=torch.int32, device=self.device)
+        self._expanded_idx_mapping_cpu = torch.empty(
+            self.max_num_tokens, dtype=torch.int32, device="cpu", pin_memory=pin_memory
+        )
+        self._expanded_idx_mapping_gpu = torch.empty(self.max_num_tokens, dtype=torch.int32, device=self.device)
+        self._expanded_local_pos_cpu = torch.empty(
+            self.max_num_tokens, dtype=torch.int32, device="cpu", pin_memory=pin_memory
+        )
+        self._expanded_local_pos_gpu = torch.empty(self.max_num_tokens, dtype=torch.int32, device=self.device)
+        self._query_start_loc_cpu = torch.empty(
+            self.max_num_reqs + 2, dtype=torch.int32, device="cpu", pin_memory=pin_memory
+        )
+        self._logits_indices_cpu = torch.empty(
+            self.max_num_tokens, dtype=torch.int64, device="cpu", pin_memory=pin_memory
+        )
+        self._logits_indices_gpu = torch.empty(self.max_num_tokens, dtype=torch.int64, device=self.device)
+        self._num_sampled_staging_cpu = torch.empty(
+            self.max_num_reqs, dtype=torch.int32, device="cpu", pin_memory=pin_memory
+        )
+        self._num_sampled_staging_gpu = torch.empty(self.max_num_reqs, dtype=torch.int32, device=self.device)
+        self._num_rejected_staging_cpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device="cpu", pin_memory=pin_memory
+        )
+        self._num_rejected_staging_gpu = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=self.device)
+
+        self._idx_mapping_np = self._idx_mapping_cpu.numpy()
+        self._cu_num_logits_np = self._cu_num_logits_cpu.numpy()
+        self._expanded_idx_mapping_np = self._expanded_idx_mapping_cpu.numpy()
+        self._expanded_local_pos_np = self._expanded_local_pos_cpu.numpy()
+        self._query_start_loc_np = self._query_start_loc_cpu.numpy()
+        self._logits_indices_np = self._logits_indices_cpu.numpy()
         # PrefillCacheHit / ChunkedPrefill must not replay FULL mixed ACLGraphs
         # (same as MRv1 `_determine_batch_execution_and_padding`). FULL_DECODE_ONLY
         # already keeps those batches eager via mixed_mode=NONE.
@@ -228,12 +268,14 @@ class NPUModelRunner310V2(NPUModelRunner):
             num_scheduled_tokens,
             num_valid_tokens,
         )
-        idx_mapping_np = np.fromiter(
+        idx_mapping_np = self._idx_mapping_np[:num_reqs]
+        idx_mapping_np[:] = np.fromiter(
             map(self.req_states.req_id_to_index.get, req_ids),
             dtype=np.int32,
             count=num_reqs,
         )
-        idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        idx_mapping = self._idx_mapping_gpu[:num_reqs]
+        idx_mapping.copy_(self._idx_mapping_cpu[:num_reqs], non_blocking=True)
         # Postprocess owns request bookkeeping on CPU, like MRV1. Preserve the
         # exact batch order so it never has to copy indices/query lengths back.
         self._postprocess_idx_mapping_np = idx_mapping_np
@@ -241,10 +283,14 @@ class NPUModelRunner310V2(NPUModelRunner):
         num_draft_tokens_per_req = None
         if not draft_tokens_map:
             total_num_draft_tokens = 0
-            cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
-            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+            cu_num_logits_np = self._cu_num_logits_np[: num_reqs + 1]
+            cu_num_logits_np[:] = range(num_reqs + 1)
+            cu_num_logits = self._cu_num_logits_gpu[: num_reqs + 1]
+            cu_num_logits.copy_(self._cu_num_logits_cpu[: num_reqs + 1], non_blocking=True)
             expanded_idx_mapping = idx_mapping
-            expanded_local_pos = async_copy_to_gpu(np.zeros(num_reqs, dtype=np.int32), device=self.device)
+            self._expanded_local_pos_np[:num_reqs].fill(0)
+            expanded_local_pos = self._expanded_local_pos_gpu[:num_reqs]
+            expanded_local_pos.copy_(self._expanded_local_pos_cpu[:num_reqs], non_blocking=True)
         else:
             num_draft_tokens_per_req = np.fromiter(
                 (len(draft_tokens_map.get(req_id, ())) for req_id in req_ids),
@@ -254,19 +300,26 @@ class NPUModelRunner310V2(NPUModelRunner):
             num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             num_logits_per_req = num_draft_tokens_per_req + num_bonus_tokens
-            cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+            cu_num_logits_np = self._cu_num_logits_np[: num_reqs + 1]
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits_per_req, out=cu_num_logits_np[1:])
-            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+            cu_num_logits = self._cu_num_logits_gpu[: num_reqs + 1]
+            cu_num_logits.copy_(self._cu_num_logits_cpu[: num_reqs + 1], non_blocking=True)
             total_num_logits = int(cu_num_logits_np[-1])
-            expanded_idx_mapping, expanded_local_pos = expand_idx_mapping_cpu(
-                idx_mapping,
+            expand_idx_mapping_cpu(
+                idx_mapping_np,
                 total_num_logits,
                 cu_num_logits_np,
+                self._expanded_idx_mapping_np,
+                self._expanded_local_pos_np,
             )
+            expanded_idx_mapping = self._expanded_idx_mapping_gpu[:total_num_logits]
+            expanded_local_pos = self._expanded_local_pos_gpu[:total_num_logits]
+            expanded_idx_mapping.copy_(self._expanded_idx_mapping_cpu[:total_num_logits], non_blocking=True)
+            expanded_local_pos.copy_(self._expanded_local_pos_cpu[:total_num_logits], non_blocking=True)
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
-        query_start_loc_np = np.empty(self.max_num_reqs + 2, dtype=np.int32)
+        query_start_loc_np = self._query_start_loc_np
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
         query_start_loc_np[num_reqs + 1 :] = num_tokens
@@ -279,7 +332,7 @@ class NPUModelRunner310V2(NPUModelRunner):
                 batch_desc.cg_mode,
                 batch_desc.num_reqs,
             )
-        async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
+        self.input_buffers.query_start_loc.copy_(self._query_start_loc_cpu, non_blocking=True)
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         self._postprocess_query_start_loc_np = query_start_loc_np[: num_reqs + 1].copy()
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
@@ -314,19 +367,16 @@ class NPUModelRunner310V2(NPUModelRunner):
         self.input_buffers.seq_lens_np[num_reqs:num_reqs_padded] = 0
         self.input_buffers.seq_lens_np[num_reqs_padded:] = 0
         total_num_logits = num_reqs if not draft_tokens_map else int(cu_num_logits_np[-1])
-        logits_indices_np = np.empty(total_num_logits, dtype=np.int64)
+        logits_indices_np = self._logits_indices_np[:total_num_logits]
         for batch_idx in range(num_reqs):
             logits_start = int(query_start_loc_np[batch_idx + 1]) - int(
                 cu_num_logits_np[batch_idx + 1] - cu_num_logits_np[batch_idx]
             )
             cu_start = int(cu_num_logits_np[batch_idx])
             cu_end = int(cu_num_logits_np[batch_idx + 1])
-            logits_indices_np[cu_start:cu_end] = np.arange(
-                logits_start,
-                logits_start + cu_end - cu_start,
-                dtype=np.int64,
-            )
-        logits_indices = async_copy_to_gpu(logits_indices_np, device=self.device)
+            logits_indices_np[cu_start:cu_end] = range(logits_start, logits_start + cu_end - cu_start)
+        logits_indices = self._logits_indices_gpu[:total_num_logits]
+        logits_indices.copy_(self._logits_indices_cpu[:total_num_logits], non_blocking=True)
 
         seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_padded, dtype=np.int32)
         np.add(
@@ -1187,10 +1237,17 @@ class NPUModelRunner310V2(NPUModelRunner):
             sampler_output = self.sampler(logits, input_batch)
             can_sample_np = input_batch.seq_lens_np[: input_batch.num_reqs] >= input_batch.prefill_len_np
             self._sampled_tokens_cpu = None
-            self._num_sampled_cpu = torch.from_numpy(can_sample_np.astype(np.int32))
-            self._num_rejected_cpu = torch.zeros_like(self._num_sampled_cpu)
-            num_sampled = async_copy_to_gpu(can_sample_np.astype(np.int32), device=self.device)
-            num_rejected = torch.zeros_like(num_sampled)
+            num_reqs = input_batch.num_reqs
+            np.copyto(
+                self._num_sampled_staging_cpu[:num_reqs].numpy(),
+                can_sample_np,
+                casting="unsafe",
+            )
+            self._num_sampled_cpu = self._num_sampled_staging_cpu[:num_reqs]
+            self._num_rejected_cpu = self._num_rejected_staging_cpu[:num_reqs]
+            num_sampled = self._num_sampled_staging_gpu[: input_batch.num_reqs]
+            num_sampled.copy_(self._num_sampled_staging_cpu[: input_batch.num_reqs], non_blocking=True)
+            num_rejected = self._num_rejected_staging_gpu[:num_reqs]
             sampler_output.num_sampled = num_sampled
             sampler_output.num_rejected = num_rejected
             return sampler_output, num_sampled, num_rejected

@@ -12,26 +12,21 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 
 def expand_idx_mapping_cpu(
-    idx_mapping: torch.Tensor,
+    idx_mapping_np: np.ndarray,
     total_num_logits: int,
     cu_num_logits_np: np.ndarray,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    device = idx_mapping.device
-    mapping_np = idx_mapping.detach().cpu().numpy()
-    expanded_mapping_np = np.empty(total_num_logits, dtype=np.int32)
-    expanded_local_pos_np = np.empty(total_num_logits, dtype=np.int32)
+    expanded_mapping_np: np.ndarray,
+    expanded_local_pos_np: np.ndarray,
+) -> None:
+    """Expand request metadata into caller-owned persistent host buffers."""
     for req_idx in range(cu_num_logits_np.shape[0] - 1):
         start = int(cu_num_logits_np[req_idx])
         end = int(cu_num_logits_np[req_idx + 1])
         num_tokens = end - start
         if num_tokens <= 0:
             continue
-        expanded_mapping_np[start:end] = mapping_np[req_idx]
+        expanded_mapping_np[start:end] = idx_mapping_np[req_idx]
         expanded_local_pos_np[start:end] = np.arange(num_tokens, dtype=np.int32)
-    return (
-        torch.from_numpy(expanded_mapping_np).to(device=device, non_blocking=True),
-        torch.from_numpy(expanded_local_pos_np).to(device=device, non_blocking=True),
-    )
 
 
 def combine_sampled_and_draft_tokens_cpu(
