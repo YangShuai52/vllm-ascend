@@ -87,6 +87,8 @@ if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
         "chunk_fwd_o"
         "chunk_gated_delta_rule_fwd_h"
         "postprocess_sampled_v310"
+        "preprocess_mamba_align_v310"
+        "precopy_mamba_align_v310"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend310p"

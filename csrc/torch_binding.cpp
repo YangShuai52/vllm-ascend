@@ -46,6 +46,8 @@
 #include "attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
 #include "moe/postprocess_sampled_v310/postprocess_sampled_310_torch_adpt.h"
+#include "moe/preprocess_mamba_align_v310/preprocess_mamba_align_310_torch_adpt.h"
+#include "moe/precopy_mamba_align_v310/precopy_mamba_align_310_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
 #include "attention/recurrent_kda/recurrent_kda_torch_adpt.h"
 #include "attention/chunk_kda_fwd/chunk_kda_fwd_torch_adpt.h"
@@ -2758,6 +2760,22 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor(d!) all_token_ids, Tensor(e!) total_len, bool has_output_bin_counts, "
         "bool has_query_start_loc) -> (Tensor(a!), Tensor(b!), Tensor(d!), Tensor(e!))");
     ops.impl("post_update_310", torch::kPrivateUse1, &vllm_ascend::post_update_310);
+
+    ops.def(
+        "preprocess_mamba_align_310(Tensor idx_mapping, Tensor(a!) state_idx, "
+        "Tensor num_computed_tokens, Tensor query_start_loc, Tensor(b!) num_accepted_tokens, "
+        "Tensor(c!) src_col, Tensor(d!) src_off, int mamba_block_size) "
+        "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!))");
+    ops.impl("preprocess_mamba_align_310", torch::kPrivateUse1, &vllm_ascend::preprocess_mamba_align_310);
+
+    ops.def(
+        "precopy_mamba_align_310(Tensor(a!) state_idx, Tensor src_col, Tensor token_bias, "
+        "Tensor block_table_ptrs, Tensor state_base_addrs, Tensor state_block_strides, "
+        "Tensor state_elem_sizes, Tensor state_inner_sizes, Tensor state_conv_widths, "
+        "Tensor state_group_indices, Tensor state_dim_row_count, Tensor state_dim_row_stride, "
+        "Tensor idx_mapping, int num_reqs, int block_table_stride_req, bool conv_state_dim_first) "
+        "-> Tensor(a!)");
+    ops.impl("precopy_mamba_align_310", torch::kPrivateUse1, &vllm_ascend::precopy_mamba_align_310);
 
     ops.def(
         "chunk_gated_delta_rule_fwd_h(Tensor k, Tensor w, Tensor u, Tensor? g=None, *, Tensor? gk=None, Tensor? initial_state=None, bool? output_final_state=False, int? chunk_size=None, bool? save_new_value=True, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? use_exp2=False, bool? transpose_state_layout=False) -> (Tensor h_out, Tensor v_new_out, Tensor final_state_out)"

@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridAttnMetadata
@@ -298,11 +299,10 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
     ) -> None:
-        """Triton-free align preprocess + precopy for 310P prefix caching.
+        """310P align preprocess and state precopy using Ascend C.
 
-        Upstream MRv2 uses ``preprocess_mamba_align_fused_kernel[grid]`` which is
-        unavailable without Triton. Mirror the same semantics with torch ops and
-        tensor-view copies (same approach as MRv1 310P mamba utils fallback).
+        Control flow follows upstream ``MambaHybridModelState.preprocess_state``;
+        Ascend C replaces both Triton kernels.
         """
         if not self._align_mode:
             return
@@ -311,84 +311,36 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
             return
 
         mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
-        block_size = int(mamba_spec.block_size)
-        idx_mapping = input_batch.idx_mapping[:num_reqs].to(dtype=torch.long)
-        valid = idx_mapping >= 0
-        if not bool(valid.any().item()):
-            return
-        req_indices = idx_mapping.masked_select(valid)
-
-        state_idx = self._mamba_state_idx_gpu.index_select(0, req_indices)
-        num_accepted = self.num_accepted_tokens_gpu.index_select(0, req_indices)
-        src_off = torch.maximum(num_accepted - 1, torch.zeros_like(num_accepted))
-        self._mamba_src_col_gpu.index_copy_(0, req_indices, state_idx)
-        self._mamba_src_off_gpu.index_copy_(0, req_indices, src_off.to(self._mamba_src_off_gpu.dtype))
-
-        num_computed = num_computed_tokens.index_select(0, req_indices)
-        query_start_loc = input_batch.query_start_loc[: num_reqs + 1]
-        # query_start_loc is in batch order; align with valid batch rows.
-        batch_rows = torch.arange(num_reqs, device=idx_mapping.device, dtype=torch.long)
-        batch_rows = batch_rows.masked_select(valid)
-        query_lens = query_start_loc.index_select(0, batch_rows + 1) - query_start_loc.index_select(0, batch_rows)
-        computed_after = num_computed + query_lens.to(num_computed.dtype)
-        new_state_idx = (computed_after + block_size - 1) // block_size - 1
-        new_state_idx = new_state_idx.to(dtype=self._mamba_state_idx_gpu.dtype)
-        self._mamba_state_idx_gpu.index_copy_(0, req_indices, new_state_idx)
-
-        should_reset = (state_idx >= 0) & (state_idx != new_state_idx)
-        reset_indices = req_indices.masked_select(should_reset)
-        if reset_indices.numel() > 0:
-            DeviceOperator.index_fill(self.num_accepted_tokens_gpu, 0, reset_indices, 1)
-
-        self._precopy_mamba_align_torch(
-            input_batch=input_batch,
-            block_tables=block_tables,
-            kv_cache_config=kv_cache_config,
-            mamba_group_ids=mamba_group_ids,
-            num_reqs=num_reqs,
+        ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
+        torch.ops._C_ascend.preprocess_mamba_align_310(
+            input_batch.idx_mapping[:num_reqs],
+            self._mamba_state_idx_gpu,
+            num_computed_tokens,
+            input_batch.query_start_loc[: num_reqs + 1],
+            self.num_accepted_tokens_gpu,
+            self._mamba_src_col_gpu,
+            self._mamba_src_off_gpu,
+            int(mamba_spec.block_size),
         )
 
-    def _precopy_mamba_align_torch(
-        self,
-        input_batch: AscendInputBatch,
-        block_tables: tuple[torch.Tensor, ...],
-        kv_cache_config: KVCacheConfig,
-        mamba_group_ids: list[int],
-        num_reqs: int,
-    ) -> None:
-        """Copy mamba state across block boundaries without Triton."""
-        from vllm_ascend.patch.worker.patch_mamba_utils import _tensor_view_from_data_ptr
-
-        forward_context = self.vllm_config.compilation_config.static_forward_context
-        copy_funcs = self.model.get_mamba_state_copy_func()
-        for batch_i in range(num_reqs):
-            req_idx = int(input_batch.idx_mapping[batch_i].item())
-            if req_idx < 0:
-                continue
-            src_col = int(self._mamba_src_col_gpu[req_idx].item())
-            dst_col = int(self._mamba_state_idx_gpu[req_idx].item())
-            if src_col < 0 or dst_col < 0 or src_col == dst_col:
-                continue
-            token_bias = int(self._mamba_src_off_gpu[req_idx].item())
-            for group_id in mamba_group_ids:
-                block_ids = block_tables[group_id][batch_i].detach().to("cpu").tolist()
-                # Drop padded / unused slots.
-                while block_ids and block_ids[-1] < 0:
-                    block_ids.pop()
-                if not block_ids or src_col >= len(block_ids) or dst_col >= len(block_ids):
-                    continue
-                dest_block_id = block_ids[dst_col]
-                layer_names = kv_cache_config.kv_cache_groups[group_id].layer_names
-                for layer_name in layer_names:
-                    attention = forward_context[layer_name]
-                    kv_caches = attention.kv_cache
-                    for state, state_copy_func in zip(kv_caches, copy_funcs):
-                        copy_spec = state_copy_func(state, block_ids, src_col, token_bias + 1)
-                        src_state = _tensor_view_from_data_ptr(state, copy_spec.start_addr, copy_spec.num_elements)
-                        dst_state = _tensor_view_from_data_ptr(
-                            state, state[dest_block_id].data_ptr(), copy_spec.num_elements
-                        )
-                        dst_state.copy_(src_state.clone())
+        torch.ops._C_ascend.precopy_mamba_align_310(
+            self._mamba_state_idx_gpu,
+            self._mamba_src_col_gpu,
+            self._mamba_src_off_gpu,
+            ctx.block_table_ptrs,
+            ctx.state_base_addrs,
+            ctx.state_block_strides,
+            ctx.state_elem_sizes,
+            ctx.state_inner_sizes,
+            ctx.state_conv_widths,
+            ctx.state_group_indices,
+            ctx.state_dim_row_count,
+            ctx.state_dim_row_stride,
+            input_batch.idx_mapping[:num_reqs],
+            num_reqs,
+            ctx.block_table_stride_req,
+            is_conv_state_dim_first(),
+        )
 
     def postprocess_state(
         self,

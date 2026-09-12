@@ -61,6 +61,59 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> post_update_310_meta(
     (void)has_query_start_loc;
     return {num_computed_tokens, last_sampled_tokens, all_token_ids, total_len};
 }
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> preprocess_mamba_align_310_meta(
+    const at::Tensor& idx_mapping,
+    at::Tensor state_idx,
+    const at::Tensor& num_computed_tokens,
+    const at::Tensor& query_start_loc,
+    at::Tensor num_accepted_tokens,
+    at::Tensor src_col,
+    at::Tensor src_off,
+    int64_t mamba_block_size)
+{
+    (void)idx_mapping;
+    (void)num_computed_tokens;
+    (void)query_start_loc;
+    (void)mamba_block_size;
+    return {state_idx, num_accepted_tokens, src_col, src_off};
+}
+
+at::Tensor precopy_mamba_align_310_meta(
+    at::Tensor state_idx,
+    const at::Tensor& src_col,
+    const at::Tensor& token_bias,
+    const at::Tensor& block_table_ptrs,
+    const at::Tensor& state_base_addrs,
+    const at::Tensor& state_block_strides,
+    const at::Tensor& state_elem_sizes,
+    const at::Tensor& state_inner_sizes,
+    const at::Tensor& state_conv_widths,
+    const at::Tensor& state_group_indices,
+    const at::Tensor& state_dim_row_count,
+    const at::Tensor& state_dim_row_stride,
+    const at::Tensor& idx_mapping,
+    int64_t num_reqs,
+    int64_t block_table_stride_req,
+    bool conv_state_dim_first)
+{
+    (void)src_col;
+    (void)token_bias;
+    (void)block_table_ptrs;
+    (void)state_base_addrs;
+    (void)state_block_strides;
+    (void)state_elem_sizes;
+    (void)state_inner_sizes;
+    (void)state_conv_widths;
+    (void)state_group_indices;
+    (void)state_dim_row_count;
+    (void)state_dim_row_stride;
+    (void)idx_mapping;
+    (void)num_reqs;
+    (void)block_table_stride_req;
+    (void)conv_state_dim_first;
+    return state_idx;
+}
 constexpr int64_t DSA_SLOT_MAPPING_FLAT = 1;
 constexpr int64_t DSA_SLOT_MAPPING_BLOCK_OFFSET = 2;
 
@@ -2077,6 +2130,8 @@ std::tuple<at::Tensor, at::Tensor> situ_mx_quant_meta(
 namespace {
 TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("post_update_310", &vllm_ascend::meta::post_update_310_meta);
+    ops.impl("preprocess_mamba_align_310", &vllm_ascend::meta::preprocess_mamba_align_310_meta);
+    ops.impl("precopy_mamba_align_310", &vllm_ascend::meta::precopy_mamba_align_310_meta);
     // causal_conv1d_310
     ops.impl("npu_causal_conv1d_310", &vllm_ascend::meta::npu_causal_conv1d_310_meta);
     // npu_recurrent_gated_delta_rule_310
