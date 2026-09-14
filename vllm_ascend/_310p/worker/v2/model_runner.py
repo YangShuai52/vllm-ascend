@@ -1057,6 +1057,16 @@ class NPUModelRunner310V2(NPUModelRunner):
     ) -> None:
         """Build host-owned inputs, then patch decode tokens from NPU state."""
         draft_tokens_map = draft_tokens_map or {}
+        active_draft_tokens_cpu = None
+        if draft_tokens_map:
+            # scheduled_spec_decode_tokens carries scheduling placeholders
+            # (commonly -1), not the draft IDs produced by the speculator.
+            # Gather the real active rows from request-state storage once.
+            active_draft_tokens_cpu = (
+                self.req_states.draft_tokens.index_select(0, idx_mapping.to(torch.int64))
+                .to(dtype=self.input_ids_cpu.dtype)
+                .cpu()
+            )
         self.input_ids_cpu[:num_tokens_after_padding].zero_()
         self.next_prefill_tokens_cpu.zero_()
         decode_req_indices: list[int] = []
@@ -1085,10 +1095,11 @@ class NPUModelRunner310V2(NPUModelRunner):
                 decode_input_indices.append(start)
             drafts = draft_tokens_map.get(req_ids[batch_idx], ())
             if drafts:
+                assert active_draft_tokens_cpu is not None
                 needs_host_copy = True
                 draft_count = min(len(drafts), end - start - 1)
-                self.input_ids_cpu[start + 1 : start + 1 + draft_count] = torch.tensor(
-                    drafts[:draft_count], dtype=self.input_ids_cpu.dtype
+                self.input_ids_cpu[start + 1 : start + 1 + draft_count].copy_(
+                    active_draft_tokens_cpu[batch_idx, :draft_count]
                 )
 
         if needs_host_copy:
