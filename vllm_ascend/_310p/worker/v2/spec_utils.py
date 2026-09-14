@@ -170,20 +170,6 @@ def greedy_rejection_sample_cpu(
             sampled_cpu[req_idx, 0] = int(target_argmax_cpu[start])
             accepted = 1
         num_sampled_cpu[req_idx] = accepted
-        if req_idx == 0:
-            target_tokens = target_argmax_cpu[start : end - 1]
-            draft_tokens = draft_np[start + 1 : end]
-            print(
-                "[MTP_ACCEPT]"
-                f" cu=({start},{end})"
-                f" input={draft_np[start:end].tolist()}"
-                f" target={target_argmax_cpu[start:end].tolist()}"
-                f" target_verify={target_tokens.tolist()}"
-                f" draft_verify={draft_tokens.tolist()}"
-                f" match={(target_tokens == draft_tokens).tolist()}"
-                f" accepted={accepted}",
-                flush=True,
-            )
 
     return (
         sampled_cpu.to(device=target_logits.device, non_blocking=True),
