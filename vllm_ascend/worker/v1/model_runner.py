@@ -398,7 +398,16 @@ class NPUModelRunner(GPUModelRunner):
         self.device_metadata_providers: dict[int, DeviceMetadataTaskProvider] | None = None
         self.pin_memory = PIN_MEMORY
 
-        set_offloader(create_offloader(self.offload_config))
+        if (vllm_config.additional_config or {}).get("ssd_weight_offload") is not None:
+            if self.lora_config or self.speculative_config or self.parallel_config.enable_eplb:
+                raise ValueError("SSD weight experiment does not support LoRA, speculative decoding or EPLB")
+        set_offloader(
+            create_offloader(
+                self.offload_config,
+                (vllm_config.additional_config or {}).get("ssd_weight_offload"),
+                enforce_eager=self.model_config.enforce_eager,
+            )
+        )
 
         # NOTE: For FULL mode we change +1 to +2 to reserve extra space for padding.
         # See _pad_query_start_loc_for_fia.
