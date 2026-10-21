@@ -97,6 +97,8 @@ class HardwareCapability(Enum):
     FP8_ATTENTION = auto()
     # Select the compatibility grouped-top-k router used by the fused-MoE path.
     FUSED_MOE_COMPATIBILITY = auto()
+    # Route effective EP through the shared All2All backend.
+    MOE_ALLTOALL_ONLY = auto()
     # Use npu_rotary_mul with adjacent pairs (rotary_mode="interleave").
     FUSED_ROTARY_MUL_INTERLEAVE = auto()
     # Pass ``glu_alpha`` and ``glu_bias`` to the fused dequant-SwiGLU-quant operator.
@@ -199,7 +201,6 @@ class MoECommPolicy(Enum):
     CAPACITY_AND_EXPERT_DENSITY = auto()
     FUSED_OR_CAPACITY = auto()
     CAPACITY_AND_WORLD_SIZE = auto()
-    ALLGATHER = auto()
 
 
 class QuantizationBackendFamily(Enum):
@@ -318,13 +319,14 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
             device_adaptor_family=DeviceAdaptorFamily.COMPATIBILITY,
             device_addressing_mode=DeviceAddressingMode.DIRECT,
             weight_layout_policy=WeightLayoutPolicy.FORCE_NZ,
-            moe_comm_policy=MoECommPolicy.ALLGATHER,
+            moe_comm_policy=MoECommPolicy.CAPACITY_AND_EXPERT_DENSITY,
             quantization_backend_family=QuantizationBackendFamily.COMPATIBILITY,
             capabilities=frozenset(
                 {
                     HardwareCapability.COMPATIBILITY_OP_IMPLEMENTATIONS,
                     HardwareCapability.DISTRIBUTED_COMMUNICATION_ADAPTATION,
                     HardwareCapability.FUSED_MOE_COMPATIBILITY,
+                    HardwareCapability.MOE_ALLTOALL_ONLY,
                     HardwareCapability.FUSED_SWIGLU_TUNING_ARGS,
                     HardwareCapability.GDN_COMPATIBILITY,
                     HardwareCapability.IRQ_CPU_RESERVATION,

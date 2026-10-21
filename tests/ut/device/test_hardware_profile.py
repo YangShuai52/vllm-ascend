@@ -159,7 +159,7 @@ _EXPECTED_CAPABILITIES = {
             DeviceAdaptorFamily.COMPATIBILITY,
             DeviceAddressingMode.DIRECT,
             WeightLayoutPolicy.FORCE_NZ,
-            MoECommPolicy.ALLGATHER,
+            MoECommPolicy.CAPACITY_AND_EXPERT_DENSITY,
             QuantizationBackendFamily.COMPATIBILITY,
         ),
         (

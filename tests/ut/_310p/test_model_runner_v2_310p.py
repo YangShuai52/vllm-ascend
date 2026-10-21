@@ -72,6 +72,14 @@ def test_config_accepts_tensor_parallelism() -> None:
     NPUModelRunner310V2._validate_config(_make_vllm_config())
 
 
+@pytest.mark.parametrize("enforce_eager", [False, True])
+def test_config_accepts_expert_parallelism(enforce_eager) -> None:
+    config = _make_vllm_config()
+    config.parallel_config.enable_expert_parallel = True
+    config.model_config.enforce_eager = enforce_eager
+    NPUModelRunner310V2._validate_config(config)
+
+
 @pytest.mark.parametrize(
     ("has_mamba", "uses_eagle_block_drop", "num_spec_tokens", "expected"),
     [
@@ -561,7 +569,7 @@ def test_finished_requests_synchronize_before_reusing_layout(finished_req_ids, s
 def test_config_rejects_non_tp_parallelism(setting: str) -> None:
     config = _make_vllm_config()
     setattr(config.parallel_config, setting, 2)
-    with pytest.raises(NotImplementedError, match="only supports tensor parallelism"):
+    with pytest.raises(NotImplementedError, match="only supports tensor and expert parallelism"):
         NPUModelRunner310V2._validate_config(config)
 
 

@@ -193,7 +193,10 @@ class AscendMoERunner310(AscendMoERunner):
             # 310P disables the unsupported feature. Restore the upstream entry
             # so its fake output contract matches the single-stream execution.
             self._forward_entry = self._select_forward()
-        _MoECommMethods[_moe_config_key(MoECommType.ALLGATHER, self.moe_config)] = AllGatherCommImpl310(self.moe_config)
+        if self.moe_config.ep_size == 1:
+            _MoECommMethods[_moe_config_key(MoECommType.ALLGATHER, self.moe_config)] = AllGatherCommImpl310(
+                self.moe_config
+            )
 
     def _compute_router_logits(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
         gate = self.gate

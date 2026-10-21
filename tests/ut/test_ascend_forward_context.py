@@ -500,13 +500,17 @@ def test_select_moe_comm_method_a5_preserves_draft_quant_guard(monkeypatch, num_
     )
 
 
-def test_select_moe_comm_method_310p_uses_allgather(monkeypatch):
+@pytest.mark.parametrize("use_v2", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 128, 4096])
+def test_select_moe_comm_method_310p(monkeypatch, use_v2, num_tokens):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
         device_type=AscendDeviceType._310P,
     )
 
-    assert afc.select_moe_comm_method(128, _make_vllm_config()) == MoECommType.ALLGATHER
+    config = _make_vllm_config()
+    config.use_v2_model_runner = use_v2
+    assert afc.select_moe_comm_method(num_tokens, config) == MoECommType.ALLTOALL
 
 
 @pytest.mark.parametrize("model_owned", [False, True])
