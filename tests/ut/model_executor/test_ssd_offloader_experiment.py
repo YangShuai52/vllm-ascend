@@ -44,6 +44,18 @@ class TestSSDIO(unittest.TestCase):
         finally:
             path.unlink()
 
+    def test_storage_span_preserves_transpose_and_gaps(self):
+        span = self.module.storage_numel
+        self.assertEqual(span((3, 4), (4, 1)), 12)
+        self.assertEqual(span((4, 3), (1, 4)), 12)
+        self.assertEqual(span((3, 2), (5, 1)), 12)
+        self.assertEqual(span((), ()), 1)
+        self.assertEqual(span((0, 4), (4, 1)), 0)
+        with self.assertRaises(ValueError):
+            span((2,), (-1,))
+        with self.assertRaises(ValueError):
+            span((2, 3), (1,))
+
     def test_partial_reads_are_retried(self):
         class PartialReader(io.BytesIO):
             def readinto(self, destination):
@@ -75,6 +87,8 @@ class TestSSDReadScheduling(unittest.TestCase):
             "sys.modules",
             {
                 "torch": torch,
+                "torch_npu": SimpleNamespace(),
+                "vllm_ascend.utils": SimpleNamespace(ACL_FORMAT_FRACTAL_NZ=29),
                 "vllm.logger": logger,
                 "vllm.model_executor.offloader.prefetch": upstream,
                 "vllm_ascend.model_executor.offloader.prefetch": ascend,
@@ -82,6 +96,43 @@ class TestSSDReadScheduling(unittest.TestCase):
             },
         ):
             self.module = load_source("ssd_under_test", _SOURCE / "ssd.py")
+
+    def test_nz_transpose_happens_after_format_cast(self):
+        calls = []
+
+        class Tensor:
+            def __init__(self, shape):
+                self.shape = shape
+
+            def stride(self):
+                return (self.shape[1], 1)
+
+            def transpose(self, first, second):
+                calls.append(("transpose", first, second))
+                return "transposed-nz"
+
+        def empty(shape, **kwargs):
+            calls.append(("allocate", shape))
+            return Tensor(shape)
+
+        def cast(tensor, format_code):
+            calls.append(("cast", tensor.shape, format_code))
+            return tensor
+
+        self.module.torch.empty = empty
+        self.module.torch_npu.npu_format_cast = cast
+        info = SimpleNamespace(name="weight", shape=(4, 3), stride=(1, 4), dtype="int8")
+        result = self.module.make_ssd_nz_buffer(info, "npu:0")
+        self.assertEqual(result, "transposed-nz")
+        self.assertEqual(calls, [("allocate", (3, 4)), ("cast", (3, 4), 29), ("transpose", 0, 1)])
+
+    def test_unrecognized_nz_view_fails_instead_of_silently_changing_layout(self):
+        self.module.torch.empty = lambda *args, **kwargs: SimpleNamespace(stride=lambda: (3, 1))
+        self.module.torch_npu.npu_format_cast = Mock()
+        info = SimpleNamespace(name="weight", shape=(4, 3), stride=(8, 2), dtype="int8")
+        with self.assertRaisesRegex(ValueError, "Unsupported non-contiguous NZ"):
+            self.module.make_ssd_nz_buffer(info, "npu:0")
+        self.module.torch_npu.npu_format_cast.assert_not_called()
 
     def test_ram_reuse_waits_for_h2d_and_wraps_odd_layer_count(self):
         offloader = self.module.AscendSSDOffloader.__new__(self.module.AscendSSDOffloader)

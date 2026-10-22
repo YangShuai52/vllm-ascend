@@ -7,23 +7,42 @@ are deliberately retained for inspection (no automatic directory deletion).
 """
 
 import atexit
+import hashlib
 import json
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
+import torch_npu
 from vllm.logger import logger
 from vllm.model_executor.offloader.prefetch import StaticBufferPool
 
 from vllm_ascend.model_executor.offloader.prefetch import (
     AscendPrefetchOffloader,
-    _format_static_buffers_for_nz,
 )
-from vllm_ascend.model_executor.offloader.ssd_io import read_exact_into
+from vllm_ascend.model_executor.offloader.ssd_io import read_exact_into, storage_numel
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 _SLOTS = 2
 _ALIGNMENT = 64
+
+
+def make_ssd_nz_buffer(info, device):
+    """Reproduce format-cast-before-transpose used by 310P quantized linear."""
+    if len(info.shape) == 2 and info.stride == (1, info.shape[0]):
+        base = torch.empty(tuple(reversed(info.shape)), dtype=info.dtype, device=device)
+        return torch_npu.npu_format_cast(base, ACL_FORMAT_FRACTAL_NZ).transpose(0, 1)
+    template = torch.empty(info.shape, dtype=info.dtype, device=device)
+    if tuple(template.stride()) != info.stride:
+        raise ValueError(f"Unsupported non-contiguous NZ SSD weight: {info.name}, {info.shape}, {info.stride}")
+    return torch_npu.npu_format_cast(template, ACL_FORMAT_FRACTAL_NZ)
+
+
+def logical_digest(tensor):
+    """Hash logical CPU values independently of storage strides or padding."""
+    values = tensor.contiguous().reshape(-1).view(torch.uint8).numpy()
+    return hashlib.sha256(memoryview(values)).hexdigest()
 
 
 class AscendSSDOffloader(AscendPrefetchOffloader):
@@ -82,32 +101,54 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
         self.infos = []
         for offloader in self.module_offloaders:
             offloader.sync_cpu_storage()
-            self.infos.append(offloader.get_param_infos())
+            infos = offloader.get_param_infos()
+            for info in infos:
+                parameter = offloader._param_offloaders[info.name]._param
+                info.stride = getattr(parameter, "_vllm_ascend_prefetch_npu_stride", info.stride)
+            self.infos.append(infos)
         signatures = [[(info.key, info.use_nz_buffer) for info in infos] for infos in self.infos]
         if any(signature != signatures[0] for signature in signatures[1:]):
             raise ValueError("SSD experiment requires identical selected parameter shapes/strides/formats per layer")
         self.buffer_pool = StaticBufferPool(self.infos[0], _SLOTS, self.device)
+        for info in self.infos[0]:
+            if info.use_nz_buffer:
+                self.buffer_pool._buffers[info.key] = [make_ssd_nz_buffer(info, self.device) for _ in range(_SLOTS)]
         for index, offloader in enumerate(self.module_offloaders):
-            offloader.assign_buffer_slot(self.buffer_pool, index % _SLOTS)
-        # Eager permits ND CPU to NZ HBM conversion on 310P. Do not disable NZ.
-        _format_static_buffers_for_nz(
-            self.module_offloaders, self.buffer_pool, [info for infos in self.infos for info in infos]
-        )
+            for info in self.infos[index]:
+                parameter = offloader._param_offloaders[info.name]
+                target = self.buffer_pool.get_buffer(info.name, info.shape, info.stride, info.dtype, index % _SLOTS)
+                if tuple(target.stride()) != info.stride:
+                    raise RuntimeError(
+                        f"SSD HBM stride mismatch: {info.name}, expected={info.stride}, actual={target.stride()}"
+                    )
+                parameter._gpu_buffer = target
+                parameter._param.data = target
         self.layout = []
         layer_bytes = 0
         for info in self.infos[0]:
             layer_bytes = (layer_bytes + _ALIGNMENT - 1) // _ALIGNMENT * _ALIGNMENT
-            self.layout.append((layer_bytes, info.num_bytes))
-            layer_bytes += info.num_bytes
+            size = storage_numel(info.shape, info.stride) * torch.empty((), dtype=info.dtype).element_size()
+            self.layout.append((layer_bytes, size))
+            layer_bytes += size
         self.layer_bytes = layer_bytes
         manifest = []
+        self.expected_digests = {}
+        self.verified_layers = set()
         for index, offloader in enumerate(self.module_offloaders):
             path = self.directory / f"layer-{index:05d}.bin"
             with path.open("wb", buffering=0) as output:
                 output.truncate(layer_bytes)
-                for info, (offset, _) in zip(self.infos[index], self.layout):
+                for info, (offset, size) in zip(self.infos[index], self.layout):
                     parameter = offloader._param_offloaders[info.name]
-                    data = parameter._cpu_storage.contiguous().reshape(-1).view(torch.uint8).numpy()
+                    self.expected_digests[index, info.name] = logical_digest(parameter._cpu_storage)
+                    # Preserve physical strides instead of packing logical contiguous
+                    # values and then passing a different view to H2D.
+                    elements = storage_numel(info.shape, info.stride)
+                    physical = torch.zeros(elements, dtype=info.dtype, device="cpu")
+                    physical.as_strided(info.shape, info.stride).copy_(parameter._cpu_storage)
+                    data = physical.view(torch.uint8).numpy()
+                    if len(data) != size:
+                        raise RuntimeError(f"SSD export size mismatch: {info.name}")
                     output.seek(offset)
                     view = memoryview(data)
                     written = 0
@@ -116,7 +157,7 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
                         if not count:
                             raise OSError(f"Short write exporting SSD weights: {path}")
                         written += count
-                    del view, data
+                    del view, data, physical
                     # Parameters now point to HBM; release the full CPU backing.
                     parameter._cpu_storage = None
             manifest.append({"layer": index, "file": path.name, "bytes": layer_bytes})
@@ -136,6 +177,7 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
         self.initialized = True
         logger.info(
             "SSD weight experiment: layers=%d RAM=%d bytes HBM pool=%d bytes files=%s; "
+            "SERIAL precision diagnosis; first use verifies disk values and HBM readback; "
             "startup RAM and OS page cache are NOT bounded by the staging pool",
             len(self.module_offloaders),
             _SLOTS * layer_bytes,
@@ -155,19 +197,34 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
 
     def _upload(self, sequence):
         self.reads.pop(sequence).result()
+        # Temporarily serialize compute/H2D to isolate stream races while
+        # validating the quantized layout. Restore overlap only after NPU checks.
+        torch.npu.current_stream().synchronize()
         slot = sequence % _SLOTS
         index = sequence % len(self.module_offloaders)
         if self.compute_valid[slot]:
             self.copy_stream.wait_event(self.compute_done[slot])
         with torch.npu.stream(self.copy_stream):
             for info, (offset, size) in zip(self.infos[index], self.layout):
-                source = self.ram[slot][offset : offset + size].view(info.dtype).reshape(info.shape)
+                source = self.ram[slot][offset : offset + size].view(info.dtype).as_strided(info.shape, info.stride)
+                if index not in self.verified_layers:
+                    if logical_digest(source) != self.expected_digests[index, info.name]:
+                        raise RuntimeError(f"SSD logical weight mismatch before H2D: layer={index} param={info.name}")
                 target = self.buffer_pool.get_buffer(info.name, info.shape, info.stride, info.dtype, slot)
                 target.copy_(source, non_blocking=True)
             # Fresh event per transfer: the I/O worker must not observe a re-recorded event.
             event = torch.npu.Event()
             event.record(self.copy_stream)
             self.copy_done[slot] = event
+        self.copy_stream.synchronize()
+        if index not in self.verified_layers:
+            for info, (offset, size) in zip(self.infos[index], self.layout):
+                source = self.ram[slot][offset : offset + size].view(info.dtype).as_strided(info.shape, info.stride)
+                target = self.buffer_pool.get_buffer(info.name, info.shape, info.stride, info.dtype, slot)
+                if not torch.equal(target.cpu(), source):
+                    raise RuntimeError(f"SSD HBM readback mismatch: layer={index} param={info.name}")
+            self.verified_layers.add(index)
+            logger.info("SSD precision check passed: layer=%d parameters=%d", index, len(self.infos[index]))
         self.bytes_read += self.layer_bytes
         self._queue_read(sequence + _SLOTS, event)
 

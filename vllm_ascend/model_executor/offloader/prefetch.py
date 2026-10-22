@@ -222,6 +222,10 @@ class _ModuleOffloader(VllmModuleOffloader):
         """
         for param_offloader in self._param_offloaders.values():
             param = param_offloader._param
+            if param.data.device.type == "npu":
+                # CPU conversion can normalize strides. SSD must reconstruct the
+                # processed device view, especially NZ followed by transpose on 310P.
+                param._vllm_ascend_prefetch_npu_stride = tuple(param.data.stride())
             if _is_using_nz_weight(param):
                 mark_prefetch_offload_nz_weight(param)
 
