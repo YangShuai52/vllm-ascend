@@ -134,6 +134,34 @@ class TestSSDReadScheduling(unittest.TestCase):
             self.module.make_ssd_nz_buffer(info, "npu:0")
         self.module.torch_npu.npu_format_cast.assert_not_called()
 
+    def test_nz_copy_uses_canonical_base_and_explicit_device_conversion(self):
+        target = Mock()
+        source = Mock()
+        target_base = target.transpose.return_value
+        source_base = source.transpose.return_value
+        target_base.device = "npu:0"
+        device_nd = source_base.contiguous.return_value.to.return_value
+        device_nz = object()
+        cast = Mock(return_value=device_nz)
+        self.module.torch_npu.npu_format_cast = cast
+        info = SimpleNamespace(use_nz_buffer=True, shape=(4, 3), stride=(1, 4))
+        self.module.copy_ssd_weight(info, target, source)
+        target.transpose.assert_called_once_with(0, 1)
+        source.transpose.assert_called_once_with(0, 1)
+        source_base.contiguous.return_value.to.assert_called_once_with(device="npu:0", non_blocking=False)
+        cast.assert_called_once_with(device_nd, 29)
+        target_base.copy_.assert_called_once_with(device_nz, non_blocking=False)
+        target.copy_.assert_not_called()
+
+    def test_nd_copy_does_not_format_cast_or_transpose(self):
+        target, source = Mock(), Mock()
+        self.module.torch_npu.npu_format_cast = Mock()
+        info = SimpleNamespace(use_nz_buffer=False, shape=(4, 3), stride=(3, 1))
+        self.module.copy_ssd_weight(info, target, source)
+        target.copy_.assert_called_once_with(source, non_blocking=True)
+        target.transpose.assert_not_called()
+        self.module.torch_npu.npu_format_cast.assert_not_called()
+
     def test_ram_reuse_waits_for_h2d_and_wraps_odd_layer_count(self):
         offloader = self.module.AscendSSDOffloader.__new__(self.module.AscendSSDOffloader)
         offloader.device = "npu:0"

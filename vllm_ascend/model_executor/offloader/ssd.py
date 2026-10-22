@@ -39,6 +39,26 @@ def make_ssd_nz_buffer(info, device):
     return torch_npu.npu_format_cast(template, ACL_FORMAT_FRACTAL_NZ)
 
 
+def ssd_transfer_views(info, target, source):
+    """Transfer canonical NZ bases, not the transposed views used by matmul."""
+    if info.use_nz_buffer and len(info.shape) == 2 and info.stride == (1, info.shape[0]):
+        return target.transpose(0, 1), source.transpose(0, 1)
+    return target, source
+
+
+def copy_ssd_weight(info, target, source):
+    target, source = ssd_transfer_views(info, target, source)
+    if info.use_nz_buffer:
+        # Do not rely on CPU->NZ copy_ to both convert layout and honor a view.
+        # Explicitly upload ND, format-cast on NPU, then copy matching NZ bases.
+        # This diagnostic path uses temporary HBM bounded by one parameter.
+        device_nd = source.contiguous().to(device=target.device, non_blocking=False)
+        device_nz = torch_npu.npu_format_cast(device_nd, ACL_FORMAT_FRACTAL_NZ)
+        target.copy_(device_nz, non_blocking=False)
+    else:
+        target.copy_(source, non_blocking=True)
+
+
 def logical_digest(tensor):
     """Hash logical CPU values independently of storage strides or padding."""
     values = tensor.contiguous().reshape(-1).view(torch.uint8).numpy()
@@ -211,7 +231,7 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
                     if logical_digest(source) != self.expected_digests[index, info.name]:
                         raise RuntimeError(f"SSD logical weight mismatch before H2D: layer={index} param={info.name}")
                 target = self.buffer_pool.get_buffer(info.name, info.shape, info.stride, info.dtype, slot)
-                target.copy_(source, non_blocking=True)
+                copy_ssd_weight(info, target, source)
             # Fresh event per transfer: the I/O worker must not observe a re-recorded event.
             event = torch.npu.Event()
             event.record(self.copy_stream)
@@ -221,8 +241,12 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
             for info, (offset, size) in zip(self.infos[index], self.layout):
                 source = self.ram[slot][offset : offset + size].view(info.dtype).as_strided(info.shape, info.stride)
                 target = self.buffer_pool.get_buffer(info.name, info.shape, info.stride, info.dtype, slot)
-                if not torch.equal(target.cpu(), source):
-                    raise RuntimeError(f"SSD HBM readback mismatch: layer={index} param={info.name}")
+                canonical_target, canonical_source = ssd_transfer_views(info, target, source)
+                if not torch.equal(canonical_target.cpu(), canonical_source):
+                    raise RuntimeError(
+                        f"SSD HBM readback mismatch: layer={index} param={info.name} "
+                        f"shape={info.shape} stride={info.stride} NZ={info.use_nz_buffer}"
+                    )
             self.verified_layers.add(index)
             logger.info("SSD precision check passed: layer=%d parameters=%d", index, len(self.infos[index]))
         self.bytes_read += self.layer_bytes
