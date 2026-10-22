@@ -619,6 +619,8 @@ class AscendConfig:
     msmonitor_use_daemon: bool = False
     enable_transpose_kv_cache_by_block: bool = True
     weight_nz_mode: int = 1
+    # Local SSD layer-streaming experiment, consumed by the V1 model runner.
+    ssd_weight_offload: dict[str, str] | None = None
 
     # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
     ascend_compilation_config: AscendCompilationConfig = dataclasses.field(default_factory=AscendCompilationConfig)
@@ -656,6 +658,14 @@ class AscendConfig:
     _sparse_li_c4_layer_names: set[str] = dataclasses.field(default_factory=set, init=False, repr=False)
     _sparse_li_layer_filter_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
 
+    @field_validator("ssd_weight_offload")
+    @classmethod
+    def _validate_ssd_weight_offload(cls, value):
+        if value is not None:
+            if set(value) != {"path"} or not value["path"].strip():
+                raise ValueError("ssd_weight_offload requires exactly one non-empty 'path' string")
+        return value
+
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):
         if self.weight_nz_mode not in (0, 1, 2):
@@ -683,6 +693,14 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if self.ssd_weight_offload is not None:
+            if vc.use_v2_model_runner:
+                raise ValueError(
+                    "SSD weight offload experiment only supports Model Runner V1; "
+                    "set VLLM_USE_V2_MODEL_RUNNER=0 before starting vllm serve"
+                )
+            if not vc.model_config.enforce_eager:
+                raise ValueError("SSD weight offload experiment requires --enforce-eager")
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None

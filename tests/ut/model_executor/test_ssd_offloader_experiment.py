@@ -3,6 +3,7 @@
 These checks do not validate Ascend stream semantics or NZ conversion.
 """
 
+import ast
 import importlib.util
 import io
 import os
@@ -158,6 +159,31 @@ class TestSSDReadScheduling(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "sequential"):
             module.forward("hidden")
         original.assert_not_called()
+
+
+class TestSSDConfiguration(unittest.TestCase):
+    def test_registered_field_and_path_validation(self):
+        # Exercise the real validator body without importing the NPU-dependent
+        # module. Full pydantic construction still needs the target environment.
+        source = ast.parse((_ROOT / "vllm_ascend/ascend_config.py").read_text(encoding="utf-8"))
+        config = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "AscendConfig")
+        self.assertTrue(
+            any(
+                isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "ssd_weight_offload"
+                for node in config.body
+            )
+        )
+        validator = next(node for node in config.body if getattr(node, "name", None) == "_validate_ssd_weight_offload")
+        validator.decorator_list = []
+        namespace = {}
+        exec(compile(ast.Module(body=[validator], type_ignores=[]), "ssd_config_validator", "exec"), namespace)
+        validate = namespace[validator.name]
+        self.assertIsNone(validate(None, None))
+        value = {"path": "/home/data/offload"}
+        self.assertEqual(validate(None, value), value)
+        for invalid in ({}, {"path": " "}, {"path": "x", "typo": "y"}):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "non-empty"):
+                validate(None, invalid)
 
 
 if __name__ == "__main__":
