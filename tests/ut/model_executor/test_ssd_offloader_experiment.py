@@ -10,6 +10,7 @@ import os
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -184,6 +185,144 @@ class TestSSDConfiguration(unittest.TestCase):
         for invalid in ({}, {"path": " "}, {"path": "x", "typo": "y"}):
             with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "non-empty"):
                 validate(None, invalid)
+
+
+class TestSSDRunnerValidation(unittest.TestCase):
+    def test_both_runners_allowed_but_graphs_rejected(self):
+        source = ast.parse((_ROOT / "vllm_ascend/ascend_config.py").read_text(encoding="utf-8"))
+        config = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "AscendConfig")
+        method = next(node for node in config.body if getattr(node, "name", None) == "derive_and_validate")
+        # Execute only the SSD guard, before unrelated model configuration.
+        method.body = method.body[:2]
+        namespace = {"VllmConfig": object, "AscendConfig": object}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), "ssd_runner_guard", "exec"), namespace)
+        validate = namespace[method.name]
+        for runner in (False, True):
+            for eager in (False, True):
+                with self.subTest(v2=runner, eager=eager):
+                    value = SimpleNamespace(ssd_weight_offload={"path": "/ssd"})
+                    runtime = SimpleNamespace(
+                        use_v2_model_runner=runner, model_config=SimpleNamespace(enforce_eager=eager)
+                    )
+                    if eager:
+                        validate(value, runtime)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "enforce-eager"):
+                            validate(value, runtime)
+
+
+class TestMRV2SSDInstallation(unittest.TestCase):
+    def setUp(self):
+        self.installed = Mock()
+        upstream = ModuleType("vllm.model_executor.offloader.base")
+        upstream.BaseOffloader = object
+        upstream.NoopOffloader = object
+        upstream.set_offloader = self.installed
+        ascend = ModuleType("vllm_ascend.model_executor.offloader.prefetch")
+        ascend.AscendPrefetchOffloader = Mock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "vllm.model_executor.offloader.base": upstream,
+                "vllm_ascend.model_executor.offloader.prefetch": ascend,
+            },
+        ):
+            self.module = load_source("ssd_factory_under_test", _SOURCE / "base.py")
+        self.instance = Mock()
+        self.module.create_offloader = Mock(return_value=self.instance)
+        self.config = SimpleNamespace(
+            additional_config={"ssd_weight_offload": {"path": "/ssd"}},
+            offload_config=object(),
+            model_config=SimpleNamespace(enforce_eager=True),
+            lora_config=None,
+            speculative_config=None,
+            parallel_config=SimpleNamespace(enable_eplb=False),
+        )
+
+    def test_disabled_leaves_parent_offloader_unchanged(self):
+        self.config.additional_config = {}
+        self.assertIsNone(self.module.install_ssd_offloader(self.config))
+        self.installed.assert_not_called()
+        self.module.create_offloader.assert_not_called()
+
+    def test_enabled_installs_instance_with_eager_configuration(self):
+        self.assertIs(self.module.install_ssd_offloader(self.config), self.instance)
+        self.installed.assert_called_once_with(self.instance)
+        self.module.create_offloader.assert_called_once_with(
+            self.config.offload_config, {"path": "/ssd"}, enforce_eager=True
+        )
+
+    def test_incompatible_features_rejected_before_installation(self):
+        for name in ("lora_config", "speculative_config", "enable_eplb"):
+            with self.subTest(feature=name):
+                owner = self.config.parallel_config if name == "enable_eplb" else self.config
+                previous = getattr(owner, name)
+                setattr(owner, name, True)
+                with self.assertRaisesRegex(ValueError, "does not support"):
+                    self.module.install_ssd_offloader(self.config)
+                setattr(owner, name, previous)
+        self.installed.assert_not_called()
+
+    def test_v2_parent_install_load_finalize_shutdown_order(self):
+        # Execute actual V2 lifecycle methods with a fake upstream runner. The
+        # initializer is narrowed to its parent/install block, avoiding unrelated
+        # attention/backend setup. No hardware behavior is simulated here.
+        source = ast.parse((_ROOT / "vllm_ascend/worker/v2/model_runner.py").read_text(encoding="utf-8"))
+        runner = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
+        methods = {node.name: node for node in runner.body if isinstance(node, ast.FunctionDef)}
+        initializer = methods["__init__"]
+        initializer.body = [next(node for node in initializer.body if isinstance(node, ast.With))]
+        test_class = ast.ClassDef(
+            name="Runner",
+            bases=[ast.Name(id="Parent", ctx=ast.Load())],
+            keywords=[],
+            body=[initializer, methods["load_model"], methods["shutdown"]],
+            decorator_list=[],
+        )
+        events = []
+        instance = self.instance
+        instance.post_init.side_effect = lambda: events.append("post_init")
+        instance.close.side_effect = lambda: events.append("close")
+
+        class Parent:
+            def __init__(self, config, device):
+                events.append("parent_init")
+                self.vllm_config = config
+                self.compilation_config = SimpleNamespace(cudagraph_mode="none")
+                self.model_state = SimpleNamespace()
+                self.prompt_logprobs_worker = None
+
+            def load_model(self, *args, **kwargs):
+                events.append("model_constructed")
+                instance.post_init()
+
+            def shutdown(self):
+                events.append("parent_shutdown")
+
+        def install(config):
+            events.append("install")
+            return self.module.install_ssd_offloader(config)
+
+        namespace = {
+            "Parent": Parent,
+            "VllmConfig": object,
+            "torch": SimpleNamespace(device=object),
+            "torch_cuda_wrapper": nullcontext,
+            "install_ssd_offloader": install,
+            "get_pd_dspark_aux_layer_ids": lambda config: [],
+            "CUDAGraphMode": SimpleNamespace(NONE="none"),
+            "C8KVBlockZeroer": type("Zeroer", (), {}),
+        }
+        tree = ast.fix_missing_locations(ast.Module(body=[test_class], type_ignores=[]))
+        exec(compile(tree, "v2_ssd_lifecycle", "exec"), namespace)
+        value = namespace["Runner"](self.config, "npu:0")
+        value.load_model()
+        value.shutdown()
+        self.assertEqual(
+            events, ["parent_init", "install", "model_constructed", "post_init", "close", "parent_shutdown"]
+        )
+        instance.post_init.assert_called_once()
+        self.assertIsNone(value.ssd_weight_offloader)
 
 
 if __name__ == "__main__":

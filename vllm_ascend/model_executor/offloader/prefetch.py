@@ -160,13 +160,14 @@ class AscendPrefetchOffloader(PrefetchOffloader):
     def wrap_modules(
         self,
         modules_generator: Generator[nn.Module, None, None],
+        prefix: str = "",
     ) -> list[nn.Module]:
         import vllm.model_executor.offloader.prefetch as vllm_prefetch
 
         original_module_offloader = vllm_prefetch._ModuleOffloader
         vllm_prefetch._ModuleOffloader = _ModuleOffloader
         try:
-            return super().wrap_modules(modules_generator)
+            return super().wrap_modules(modules_generator, prefix=prefix)
         finally:
             vllm_prefetch._ModuleOffloader = original_module_offloader
 

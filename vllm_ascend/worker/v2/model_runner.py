@@ -92,6 +92,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     allocate_kv_offload_topk_profile_buffers,
     init_sparse_kv_offload_manager,
 )
+from vllm_ascend.model_executor.offloader.base import install_ssd_offloader
 from vllm_ascend.models.deepseek_v41.cache_config import uses_a5_packed_cache
 from vllm_ascend.observability.runtime_guard.hooks import (
     runtime_guard_sample_tokens,
@@ -164,6 +165,9 @@ class NPUModelRunner(GPUModelRunner):
         spec_pp_support = resolve_spec_pp_support(vllm_config)
         with torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+            # Parent creates its default offloader. Replace it before load_model;
+            # its load_model finalizes our instance after quantization processing.
+            self.ssd_weight_offloader = install_ssd_offloader(vllm_config)
         # These FIA models need post-rejection host counts on every PP stage.
         # TODO: Remove this extra PP sync when FIA and its metadata builders
         # use device lengths instead of exact CPU lengths.
@@ -551,6 +555,10 @@ class NPUModelRunner(GPUModelRunner):
                 fill_mxfp_v_scale_cache(layer.v_cache_scale, value_scale_cache)
 
     def shutdown(self) -> None:
+        offloader = getattr(self, "ssd_weight_offloader", None)
+        if offloader is not None:
+            offloader.close()
+            self.ssd_weight_offloader = None
         # Drop C8 packet views before the parent collects tensors and
         # empties the allocator cache.
         entries = getattr(self, "_c8_mxfp_v_scale_caches", None)

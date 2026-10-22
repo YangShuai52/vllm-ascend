@@ -619,7 +619,7 @@ class AscendConfig:
     msmonitor_use_daemon: bool = False
     enable_transpose_kv_cache_by_block: bool = True
     weight_nz_mode: int = 1
-    # Local SSD layer-streaming experiment, consumed by the V1 model runner.
+    # Local SSD layer-streaming experiment, consumed by V1 and V2 model runners.
     ssd_weight_offload: dict[str, str] | None = None
 
     # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
@@ -694,11 +694,6 @@ class AscendConfig:
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
         if self.ssd_weight_offload is not None:
-            if vc.use_v2_model_runner:
-                raise ValueError(
-                    "SSD weight offload experiment only supports Model Runner V1; "
-                    "set VLLM_USE_V2_MODEL_RUNNER=0 before starting vllm serve"
-                )
             if not vc.model_config.enforce_eager:
                 raise ValueError("SSD weight offload experiment requires --enforce-eager")
         engram_config = getattr(vc, "engram_config", None)
