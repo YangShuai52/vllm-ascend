@@ -21,7 +21,7 @@ from vllm.model_executor.offloader.prefetch import StaticBufferPool
 from vllm_ascend.model_executor.offloader.prefetch import (
     AscendPrefetchOffloader,
 )
-from vllm_ascend.model_executor.offloader.ssd_io import read_exact_into, storage_numel
+from vllm_ascend.model_executor.offloader.ssd_io import build_layer_layout, read_exact_into, storage_numel
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 _SLOTS = 2
@@ -66,7 +66,7 @@ def logical_digest(tensor):
 
 
 class AscendSSDOffloader(AscendPrefetchOffloader):
-    """Two-slot SSD/RAM/HBM experiment; homogeneous selected layers only.
+    """Two RAM slots and two HBM buffers per unique parameter layout.
 
     All scheduling and NPU submissions happen on the caller thread. A single
     I/O worker waits for a slot's H2D event before overwriting pinned RAM.
@@ -126,11 +126,17 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
                 parameter = offloader._param_offloaders[info.name]._param
                 info.stride = getattr(parameter, "_vllm_ascend_prefetch_npu_stride", info.stride)
             self.infos.append(infos)
-        signatures = [[(info.key, info.use_nz_buffer) for info in infos] for infos in self.infos]
-        if any(signature != signatures[0] for signature in signatures[1:]):
-            raise ValueError("SSD experiment requires identical selected parameter shapes/strides/formats per layer")
-        self.buffer_pool = StaticBufferPool(self.infos[0], _SLOTS, self.device)
-        for info in self.infos[0]:
+        unique_infos = {}
+        for infos in self.infos:
+            for info in infos:
+                previous = unique_infos.get(info.key)
+                if previous is not None and previous.use_nz_buffer != info.use_nz_buffer:
+                    raise ValueError(f"Conflicting NZ formats for SSD parameter layout: {info.name}")
+                unique_infos[info.key] = info
+        # Match upstream's pool grouping: heterogeneous layers can share matching
+        # parameters, while distinct shapes/names get their own double buffers.
+        self.buffer_pool = StaticBufferPool(list(unique_infos.values()), _SLOTS, self.device)
+        for info in unique_infos.values():
             if info.use_nz_buffer:
                 self.buffer_pool._buffers[info.key] = [make_ssd_nz_buffer(info, self.device) for _ in range(_SLOTS)]
         for index, offloader in enumerate(self.module_offloaders):
@@ -143,13 +149,16 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
                     )
                 parameter._gpu_buffer = target
                 parameter._param.data = target
-        self.layout = []
-        layer_bytes = 0
-        for info in self.infos[0]:
-            layer_bytes = (layer_bytes + _ALIGNMENT - 1) // _ALIGNMENT * _ALIGNMENT
-            size = storage_numel(info.shape, info.stride) * torch.empty((), dtype=info.dtype).element_size()
-            self.layout.append((layer_bytes, size))
-            layer_bytes += size
+        self.layouts = []
+        self.layer_sizes = []
+        for infos in self.infos:
+            layout, size = build_layer_layout(
+                [(info.shape, info.stride, torch.empty((), dtype=info.dtype).element_size()) for info in infos],
+                _ALIGNMENT,
+            )
+            self.layouts.append(layout)
+            self.layer_sizes.append(size)
+        layer_bytes = max(self.layer_sizes)
         self.layer_bytes = layer_bytes
         manifest = []
         self.expected_digests = {}
@@ -157,8 +166,8 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
         for index, offloader in enumerate(self.module_offloaders):
             path = self.directory / f"layer-{index:05d}.bin"
             with path.open("wb", buffering=0) as output:
-                output.truncate(layer_bytes)
-                for info, (offset, size) in zip(self.infos[index], self.layout):
+                output.truncate(self.layer_sizes[index])
+                for info, (offset, size) in zip(self.infos[index], self.layouts[index]):
                     parameter = offloader._param_offloaders[info.name]
                     self.expected_digests[index, info.name] = logical_digest(parameter._cpu_storage)
                     # Preserve physical strides instead of packing logical contiguous
@@ -180,7 +189,7 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
                     del view, data, physical
                     # Parameters now point to HBM; release the full CPU backing.
                     parameter._cpu_storage = None
-            manifest.append({"layer": index, "file": path.name, "bytes": layer_bytes})
+            manifest.append({"layer": index, "file": path.name, "bytes": self.layer_sizes[index]})
         (self.directory / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         self.ram = [torch.empty(layer_bytes, dtype=torch.uint8, pin_memory=True) for _ in range(_SLOTS)]
         self.ram_views = [memoryview(buffer.numpy()) for buffer in self.ram]
@@ -196,7 +205,8 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
         self._upload(0)
         self.initialized = True
         logger.info(
-            "SSD weight experiment: layers=%d RAM=%d bytes HBM pool=%d bytes files=%s; "
+            "SSD weight experiment: layers=%d RAM=%d bytes HBM layout pool=%d bytes files=%s; "
+            "two HBM buffers per unique parameter layout (not two whole layers for hybrid models); "
             "SERIAL precision diagnosis; first use verifies disk values and HBM readback; "
             "startup RAM and OS page cache are NOT bounded by the staging pool",
             len(self.module_offloaders),
@@ -211,7 +221,10 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
                 torch.npu.set_device(self.device)
                 previous_copy.synchronize()
             index = sequence % len(self.module_offloaders)
-            read_exact_into(self.directory / f"layer-{index:05d}.bin", self.ram_views[sequence % _SLOTS])
+            read_exact_into(
+                self.directory / f"layer-{index:05d}.bin",
+                self.ram_views[sequence % _SLOTS][: self.layer_sizes[index]],
+            )
 
         self.reads[sequence] = self.executor.submit(read)
 
@@ -225,7 +238,7 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
         if self.compute_valid[slot]:
             self.copy_stream.wait_event(self.compute_done[slot])
         with torch.npu.stream(self.copy_stream):
-            for info, (offset, size) in zip(self.infos[index], self.layout):
+            for info, (offset, size) in zip(self.infos[index], self.layouts[index]):
                 source = self.ram[slot][offset : offset + size].view(info.dtype).as_strided(info.shape, info.stride)
                 if index not in self.verified_layers:
                     if logical_digest(source) != self.expected_digests[index, info.name]:
@@ -238,7 +251,7 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
             self.copy_done[slot] = event
         self.copy_stream.synchronize()
         if index not in self.verified_layers:
-            for info, (offset, size) in zip(self.infos[index], self.layout):
+            for info, (offset, size) in zip(self.infos[index], self.layouts[index]):
                 source = self.ram[slot][offset : offset + size].view(info.dtype).as_strided(info.shape, info.stride)
                 target = self.buffer_pool.get_buffer(info.name, info.shape, info.stride, info.dtype, slot)
                 canonical_target, canonical_source = ssd_transfer_views(info, target, source)
@@ -249,7 +262,7 @@ class AscendSSDOffloader(AscendPrefetchOffloader):
                     )
             self.verified_layers.add(index)
             logger.info("SSD precision check passed: layer=%d parameters=%d", index, len(self.infos[index]))
-        self.bytes_read += self.layer_bytes
+        self.bytes_read += self.layer_sizes[index]
         self._queue_read(sequence + _SLOTS, event)
 
     def sync_prev_onload(self):

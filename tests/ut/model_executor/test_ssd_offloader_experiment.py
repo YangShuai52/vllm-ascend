@@ -56,6 +56,21 @@ class TestSSDIO(unittest.TestCase):
         with self.assertRaises(ValueError):
             span((2, 3), (1,))
 
+    def test_each_layer_gets_its_own_layout_and_file_size(self):
+        small, small_size = self.module.build_layer_layout([((3, 4), (4, 1), 1)])
+        large, large_size = self.module.build_layer_layout(
+            [
+                ((4, 3), (1, 4), 1),
+                ((5,), (1,), 8),
+                ((2, 2), (4, 1), 2),
+            ]
+        )
+        self.assertEqual(small, [(0, 12)])
+        self.assertEqual(small_size, 12)
+        self.assertEqual(large, [(0, 12), (64, 40), (128, 12)])
+        self.assertEqual(large_size, 140)
+        self.assertEqual(max(small_size, large_size), 140)
+
     def test_partial_reads_are_retried(self):
         class PartialReader(io.BytesIO):
             def readinto(self, destination):
@@ -167,6 +182,7 @@ class TestSSDReadScheduling(unittest.TestCase):
         offloader.device = "npu:0"
         offloader.directory = Path("unused")
         offloader.module_offloaders = [None] * 3
+        offloader.layer_sizes = [5] * 3
         offloader.ram_views = ["slot0", "slot1"]
         offloader.reads = {}
         event = SimpleNamespace(synchronize=lambda: self.calls.append("h2d-complete"))
@@ -181,6 +197,30 @@ class TestSSDReadScheduling(unittest.TestCase):
                 self.calls[sequence * 3 : sequence * 3 + 3],
                 ["device", "h2d-complete", (f"layer-{sequence % 3:05d}.bin", f"slot{sequence % 2}")],
             )
+
+    def test_mixed_layer_reads_use_file_length_not_maximum_slot_capacity(self):
+        offloader = self.module.AscendSSDOffloader.__new__(self.module.AscendSSDOffloader)
+        offloader.directory = Path("unused")
+        offloader.module_offloaders = [None, None]
+        offloader.layer_sizes = [3, 8]
+        offloader.ram_views = [memoryview(bytearray(8)), memoryview(bytearray(8))]
+        offloader.reads = {}
+        seen = []
+        self.module.read_exact_into = lambda path, slot: seen.append((path.name, len(slot)))
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            offloader.executor = executor
+            for sequence in range(4):
+                offloader._queue_read(sequence)
+                offloader.reads.pop(sequence).result()
+        self.assertEqual(
+            seen,
+            [
+                ("layer-00000.bin", 3),
+                ("layer-00001.bin", 8),
+                ("layer-00000.bin", 3),
+                ("layer-00001.bin", 8),
+            ],
+        )
 
     def test_disk_error_propagates_before_h2d(self):
         offloader = self.module.AscendSSDOffloader.__new__(self.module.AscendSSDOffloader)

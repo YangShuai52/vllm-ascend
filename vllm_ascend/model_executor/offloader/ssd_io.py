@@ -21,3 +21,15 @@ def storage_numel(shape: tuple[int, ...], stride: tuple[int, ...]) -> int:
     if any(dimension == 0 for dimension in shape):
         return 0
     return 1 + sum((dimension - 1) * step for dimension, step in zip(shape, stride))
+
+
+def build_layer_layout(parameters, alignment=64):
+    """Build one layer's byte offsets from (shape, stride, element_size)."""
+    layout = []
+    total = 0
+    for shape, stride, element_size in parameters:
+        total = (total + alignment - 1) // alignment * alignment
+        size = storage_numel(shape, stride) * element_size
+        layout.append((total, size))
+        total += size
+    return layout, total
