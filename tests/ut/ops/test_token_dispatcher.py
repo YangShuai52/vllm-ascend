@@ -1054,3 +1054,50 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         self.assertIsNotNone(result.group_list)
         self.assertIsNotNone(result.dynamic_scale)
         self.assertEqual(result.group_list_type, 1)
+
+
+@pytest.mark.parametrize(
+    "device", [AscendDeviceType._310P, AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5]
+)
+@pytest.mark.parametrize("quant_type", [QuantType.NONE, QuantType.W8A8])
+def test_alltoall_quantization_matches_routing_input_capability(device, quant_type):
+    dispatcher = object.__new__(TokenDispatcherWithAll2AllV)
+    dispatcher.lora_context = None
+    x = torch.randn(3, 16, dtype=torch.float16)
+    topk_ids = torch.tensor([[0, 1], [1, 0], [0, 1]])
+    topk_weights = torch.full((3, 2), 0.5)
+    inverse = torch.arange(6, dtype=torch.int32)
+    tokens = x.repeat_interleave(2, dim=0)
+    group_list = torch.tensor([3, 3])
+    dispatcher._dispatch_preprocess = MagicMock(
+        return_value=(tokens, inverse, group_list, [3, 3], [3, 3], torch.zeros(6), x.shape, x.shape)
+    )
+    dispatcher._dispatch_postprocess = MagicMock(side_effect=lambda received, scale, *_: (received, scale, inverse))
+    quantized = tokens.to(torch.int8)
+    scales = torch.ones(tokens.shape[0], dtype=torch.float32)
+    token_input = build_token_dispatch_input_fixture(
+        hidden_states=x, topk_weights=topk_weights, topk_ids=topk_ids, quant_type=quant_type
+    )
+    with (
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.get_current_hardware_profile",
+            return_value=get_hardware_profile(device),
+        ),
+        patch.object(TokenDispatcherWithAll2AllV, "ep_group", new_callable=PropertyMock, return_value=object()),
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_dynamic_quant",
+            return_value=(quantized, scales),
+        ) as quant,
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.async_all_to_all",
+            side_effect=lambda value, *_: (value, value.clone(), MagicMock()),
+        ) as exchange,
+    ):
+        result = dispatcher.token_dispatch(token_input)
+    expect_quant = quant_type is QuantType.W8A8 and device is not AscendDeviceType._310P
+    assert quant.call_count == int(expect_quant)
+    assert exchange.call_count == (2 if expect_quant else 1)
+    assert dispatcher._dispatch_postprocess.call_args.args[3] is expect_quant
+    assert result.hidden_states.dtype == (torch.int8 if expect_quant else torch.float16)
+    assert (result.dynamic_scale is not None) == expect_quant
+    assert token_input.quant.quant_type is quant_type

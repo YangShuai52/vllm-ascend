@@ -472,7 +472,11 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         token_dispatch_input: MoETokenDispatchInput,
     ):
         use_mxfp_quant = token_dispatch_input.quant.is_mxfp
-        with_quant = token_dispatch_input.quant.dispatch_with_quant
+        # Some expert kernels quantize floating activations locally and cannot
+        # consume the INT8 routing inputs used by quantized communication.
+        with_quant = token_dispatch_input.quant.dispatch_with_quant and get_current_hardware_profile().supports(
+            HardwareCapability.MOE_ALLTOALL_QUANTIZED_DISPATCH
+        )
         if has_lora(self.lora_context) and token_dispatch_input.quant.is_quant:
             validate_quant_moe_lora_activation_input(
                 quant_type=token_dispatch_input.quant.quant_type,

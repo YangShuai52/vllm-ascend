@@ -99,6 +99,9 @@ class HardwareCapability(Enum):
     FUSED_MOE_COMPATIBILITY = auto()
     # Route effective EP through the shared All2All backend.
     MOE_ALLTOALL_ONLY = auto()
+    # Allow All2All to exchange quantized activations and per-token scales;
+    # the destination routing and expert kernels must accept that input ABI.
+    MOE_ALLTOALL_QUANTIZED_DISPATCH = auto()
     # Use npu_rotary_mul with adjacent pairs (rotary_mode="interleave").
     FUSED_ROTARY_MUL_INTERLEAVE = auto()
     # Pass ``glu_alpha`` and ``glu_bias`` to the fused dequant-SwiGLU-quant operator.
@@ -263,6 +266,7 @@ _STANDARD_CAPABILITIES = frozenset(
         HardwareCapability.IRQ_CPU_RESERVATION,
         HardwareCapability.LORA_CUSTOM_OPS,
         HardwareCapability.MC2_HIERARCHY_COMM,
+        HardwareCapability.MOE_ALLTOALL_QUANTIZED_DISPATCH,
         HardwareCapability.MOE_GATING_TOP_K_HASH_VISION,
         HardwareCapability.NPUGRAPH_EX,
         HardwareCapability.PAGED_ATTENTION,
@@ -375,6 +379,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
                     HardwareCapability.MOE_DISPATCH_EXTRA_ARGS,
                     HardwareCapability.MOE_DISPATCH_SHARED_EXPERT_ARGS,
                     HardwareCapability.MM_REDUCE_SCATTER_AI_CPU_INFERENCE,
+                    HardwareCapability.MOE_ALLTOALL_QUANTIZED_DISPATCH,
                     HardwareCapability.MOE_GATING_TOP_K_HASH_VISION,
                     HardwareCapability.NPUGRAPH_EX,
                     HardwareCapability.STANDARD_MAMBA_PATCH,
