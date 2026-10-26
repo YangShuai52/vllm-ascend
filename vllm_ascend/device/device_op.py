@@ -1008,6 +1008,11 @@ class BaseDeviceAdaptor:
         return results
 
     @staticmethod
+    def npu_moe_token_permute(tokens, indices, num_out_tokens=None, *, num_experts):
+        kwargs = {} if num_out_tokens is None else {"num_out_tokens": num_out_tokens}
+        return torch_npu.npu_moe_token_permute(tokens=tokens, indices=indices, **kwargs)
+
+    @staticmethod
     def npu_moe_token_unpermute(permuted_tokens, sorted_indices, probs):
         return torch_npu.npu_moe_token_unpermute(
             permuted_tokens=permuted_tokens, sorted_indices=torch.abs(sorted_indices), probs=probs
@@ -2029,6 +2034,27 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
 
 
 class Ascend310PDeviceAdaptor(BaseDeviceAdaptor):
+    @staticmethod
+    def npu_moe_token_permute(tokens, indices, num_out_tokens=None, *, num_experts):
+        # MoeTokenPermute has no 310P binary. InitRoutingV2 with row_idx_type=0
+        # produces the same inverse, flattened token-major mapping consumed by
+        # token_unpermute and the shared All2All dispatcher.
+        if indices.ndim == 1:
+            indices = indices.unsqueeze(-1)
+        active_num = num_out_tokens or indices.numel()
+        permuted, inverse_mapping, _, _ = torch_npu.npu_moe_init_routing_v2(
+            tokens,
+            indices.to(torch.int32),
+            active_num=active_num,
+            expert_num=num_experts,
+            drop_pad_mode=0,
+            expert_tokens_num_flag=False,
+            active_expert_range=[0, num_experts],
+            quant_mode=-1,
+            row_idx_type=0,
+        )
+        return permuted, inverse_mapping
+
     @classmethod
     def reshape_and_cache(
         cls,

@@ -334,3 +334,58 @@ def test_clipped_swiglu_kernel_selection_per_adaptor(adaptor, uses_fused_kernel)
     gate = torch.clamp(x[..., :d], max=limit)
     up = torch.clamp(x[..., d:], min=-limit, max=limit)
     torch.testing.assert_close(out, gate * torch.sigmoid(alpha * gate) * (up + beta))
+
+
+@pytest.mark.parametrize("adaptor", [BaseDeviceAdaptor, A5DeviceAdaptor])
+@pytest.mark.parametrize("num_out_tokens", [None, 6])
+def test_moe_permute_standard_adaptors_keep_native_operator(adaptor, num_out_tokens):
+    tokens = torch.randn(3, 16)
+    indices = torch.tensor([[2, 0], [1, 2], [0, 1]], dtype=torch.int64)
+    expected = (object(), object())
+    with mock.patch("torch_npu.npu_moe_token_permute", create=True, return_value=expected) as native:
+        result = adaptor.npu_moe_token_permute(tokens, indices, num_out_tokens, num_experts=3)
+    assert result is expected
+    kwargs = {} if num_out_tokens is None else {"num_out_tokens": num_out_tokens}
+    native.assert_called_once_with(tokens=tokens, indices=indices, **kwargs)
+
+
+@pytest.mark.parametrize("expert_ids", [[[3, 0], [1, 3], [0, 2]], [2, 0, 1, 0]])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_310p_moe_permute_uses_init_routing_inverse_mapping(expert_ids, dtype):
+    indices = torch.tensor(expert_ids, dtype=dtype)
+    tokens = torch.arange(len(expert_ids) * 16, dtype=torch.float32).reshape(len(expert_ids), 16)
+    routed_ids = indices.unsqueeze(-1) if indices.ndim == 1 else indices
+
+    def reference_routing(x, ids, **kwargs):
+        order = torch.argsort(ids.flatten(), stable=True)
+        inverse = torch.empty(order.numel(), dtype=torch.int32)
+        inverse[order] = torch.arange(order.numel(), dtype=torch.int32)
+        return x[order // ids.shape[1]], inverse, None, None
+
+    with (
+        mock.patch("torch_npu.npu_moe_init_routing_v2", side_effect=reference_routing) as routing,
+        mock.patch("torch_npu.npu_moe_token_permute", create=True) as unsupported,
+    ):
+        permuted, inverse = Ascend310PDeviceAdaptor.npu_moe_token_permute(
+            tokens, indices, indices.numel(), num_experts=4
+        )
+    unsupported.assert_not_called()
+    assert routing.call_args.args[1].dtype == torch.int32
+    torch.testing.assert_close(routing.call_args.args[1], routed_ids.to(torch.int32))
+    assert routing.call_args.kwargs == {
+        "active_num": indices.numel(),
+        "expert_num": 4,
+        "drop_pad_mode": 0,
+        "expert_tokens_num_flag": False,
+        "active_expert_range": [0, 4],
+        "quant_mode": -1,
+        "row_idx_type": 0,
+    }
+    # Apply distinct expert functions, then restore top-k order using the
+    # inverse mapping. This catches token-major versus expert-major confusion.
+    expert_outputs = permuted + routed_ids.flatten().sort().values.unsqueeze(-1)
+    restored = expert_outputs[inverse.long()].reshape(*routed_ids.shape, tokens.shape[-1])
+    weights = torch.arange(1, routed_ids.numel() + 1, dtype=tokens.dtype).reshape(routed_ids.shape)
+    actual = (restored * weights.unsqueeze(-1)).sum(dim=1)
+    expected = ((tokens.unsqueeze(1) + routed_ids.unsqueeze(-1)) * weights.unsqueeze(-1)).sum(dim=1)
+    torch.testing.assert_close(actual, expected)

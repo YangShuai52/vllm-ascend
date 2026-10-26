@@ -584,10 +584,11 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         ) = self._preprocess(topk_ids)
         hidden_shape_before_permute = hidden_states.shape
 
-        permutated_local_input_tokens, reversed_local_input_permutation_mapping = torch_npu.npu_moe_token_permute(
+        permutated_local_input_tokens, reversed_local_input_permutation_mapping = DeviceOperator.npu_moe_token_permute(
             tokens=hidden_states,
             indices=topk_ids,
             num_out_tokens=num_out_tokens,
+            num_experts=self.num_experts,
         )
 
         if self.lora_context is not None:
@@ -682,8 +683,8 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
                 )
             )
         else:
-            global_input_tokens, reversed_global_input_permutation_mapping = torch_npu.npu_moe_token_permute(
-                global_input_tokens, global_input_tokens_local_experts_indices
+            global_input_tokens, reversed_global_input_permutation_mapping = DeviceOperator.npu_moe_token_permute(
+                global_input_tokens, global_input_tokens_local_experts_indices, num_experts=self.num_local_experts
             )
         if self.lora_context is not None:
             postprocess_lora_indices(
