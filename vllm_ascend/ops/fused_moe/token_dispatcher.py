@@ -467,11 +467,6 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
                 "local_expert_indices must be continuous"
             )
 
-        # TODO: Try local_rank = ep_group.rank_in_group
-        local_rank = torch.distributed.get_rank(group=self.ep_group)
-        backend = self.ep_group._get_backend(torch.device("npu"))
-        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
-
     def token_dispatch(
         self,
         token_dispatch_input: MoETokenDispatchInput,

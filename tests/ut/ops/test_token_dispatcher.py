@@ -839,6 +839,14 @@ class TestTokenDispatcherWithAllGather(TestBase):
 
 
 class TestTokenDispatcherWithAll2AllV(TestBase):
+    def test_init_does_not_create_hccl_communicator(self):
+        group = self.mock_ep_group_prop.return_value
+        group._get_backend.side_effect = AssertionError("All2All init must not create an HCCL communicator")
+        with patch("torch.distributed.get_rank", side_effect=AssertionError("unexpected process-group lookup")):
+            dispatcher = TokenDispatcherWithAll2AllV(top_k=1, num_experts=2, num_local_experts=1)
+        self.assertEqual(dispatcher.local_expert_indices, [0])
+        group._get_backend.assert_not_called()
+
     def setUp(self):
         # Patch properties
         patcher1 = patch.object(
@@ -854,14 +862,6 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         self.mock_ep_group_prop = patcher1.start()
         self.mock_ep_rank_prop = patcher2.start()
         self.mock_ep_size_prop = patcher3.start()
-
-        # TokenDispatcherWithAll2AllV obtains the local rank while building
-        # the HCCL group name.  A MagicMock group alone is not sufficient on
-        # vLLM v0.26.0: torch.distributed.get_rank still attempts to resolve
-        # the uninitialized default process group first.
-        patcher_rank = patch("torch.distributed.get_rank", return_value=0)
-        self.mock_get_rank = patcher_rank.start()
-        self.addCleanup(patcher_rank.stop)
 
         # Mock torch_npu.npu_moe_token_permute
         patcher4 = patch("torch_npu.npu_moe_token_permute", create=True)

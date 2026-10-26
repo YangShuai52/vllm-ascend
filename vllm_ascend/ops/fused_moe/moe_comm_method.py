@@ -69,8 +69,10 @@ def setup_moe_comm_method(moe_config):
     if moe_config.ep_size > 1:
         _MoECommMethods[_moe_config_key(MoECommType.ALLTOALL, moe_config)] = AlltoAllCommImpl(moe_config)
         _MoECommMethods[_moe_config_key(MoECommType.ALLGATHER, moe_config)] = AllGatherCommImpl(moe_config)
-        _MoECommMethods[_moe_config_key(MoECommType.MC2, moe_config)] = MC2CommImpl(moe_config)
-        _MoECommMethods[_moe_config_key(MoECommType.FUSED_MC2, moe_config)] = FusedMC2CommImpl(moe_config)
+        # All2All-only devices must not initialize MC2 HCCL communicators.
+        if not get_current_hardware_profile().supports(HardwareCapability.MOE_ALLTOALL_ONLY):
+            _MoECommMethods[_moe_config_key(MoECommType.MC2, moe_config)] = MC2CommImpl(moe_config)
+            _MoECommMethods[_moe_config_key(MoECommType.FUSED_MC2, moe_config)] = FusedMC2CommImpl(moe_config)
     else:
         _MoECommMethods[_moe_config_key(MoECommType.ALLGATHER, moe_config)] = AllGatherCommImpl(moe_config)
 
