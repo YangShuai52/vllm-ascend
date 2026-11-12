@@ -616,17 +616,57 @@ def test_finished_requests_synchronize_before_reusing_layout(finished_req_ids, s
 @pytest.mark.parametrize(
     "setting",
     [
-        "pipeline_parallel_size",
         "data_parallel_size",
         "decode_context_parallel_size",
         "prefill_context_parallel_size",
     ],
 )
-def test_config_rejects_non_tp_parallelism(setting: str) -> None:
+def test_config_rejects_unsupported_parallelism(setting: str) -> None:
     config = _make_vllm_config()
     setattr(config.parallel_config, setting, 2)
-    with pytest.raises(NotImplementedError, match="only supports tensor parallelism"):
+    with pytest.raises(NotImplementedError, match="unsupported parallel settings"):
         NPUModelRunner310V2._validate_config(config)
+
+
+def test_non_last_pp_rank_handles_deferred_sample_after_prefill() -> None:
+    runner = object.__new__(NPUModelRunner310V2)
+    runner.pp_handler = object()
+    runner.is_last_pp_rank = False
+    runner.device = torch.device("cpu")
+    runner.model_state = MagicMock()
+    runner.cache_config = SimpleNamespace(mamba_cache_mode="none")
+    runner.req_states = SimpleNamespace(
+        num_computed_tokens_np=np.array([2, 0]),
+        num_computed_tokens_cpu=torch.tensor([2, 0]),
+        num_computed_tokens=MagicMock(),
+        total_len=MagicMock(),
+        all_token_ids=SimpleNamespace(cpu=torch.zeros((2, 8), dtype=torch.int32)),
+        last_sampled_tokens=torch.zeros((2, 1), dtype=torch.int32),
+        last_sampled_tokens_cpu=torch.zeros((2, 1), dtype=torch.int32),
+    )
+    runner.req_states.total_len.np = np.array([4, 3])
+    runner.postprocess_num_computed_tokens(
+        SimpleNamespace(
+            idx_mapping_np=np.array([1, 0]),
+            num_computed_tokens_np=np.array([0, 2]),
+            num_scheduled_tokens=np.array([3, 2]),
+        )
+    )
+    # Row 1 was freed before its pending result arrived.
+    runner.postprocess_sampled(
+        torch.tensor([-1, 0]), torch.tensor([[91], [42]]), torch.tensor([1, 1]), torch.tensor([0, 0])
+    )
+    assert runner.req_states.last_sampled_tokens.tolist() == [[42], [0]]
+    assert runner.req_states.all_token_ids.cpu[0, 4].item() == 42
+    assert runner.req_states.num_computed_tokens_cpu.tolist() == [4, 3]
+    runner.req_states.total_len.stage_write_elem.assert_called_once_with(0, 5)
+
+
+def test_config_accepts_tp2_pp2() -> None:
+    config = _make_vllm_config()
+    config.parallel_config.tensor_parallel_size = 2
+    config.parallel_config.pipeline_parallel_size = 2
+    NPUModelRunner310V2._validate_config(config)
 
 
 def test_config_accepts_mtp_and_rejects_non_mtp() -> None:

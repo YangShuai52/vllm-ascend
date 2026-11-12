@@ -46,6 +46,7 @@ from vllm_ascend._310p.worker.v2.aclgraph import ModelAclGraphManager310
 from vllm_ascend._310p.worker.v2.block_table import Ascend310PBlockTables
 from vllm_ascend._310p.worker.v2.input_batch import Ascend310PInputBatch
 from vllm_ascend._310p.worker.v2.kv_block_zeroer import AscendKVBlockZeroer310V2
+from vllm_ascend._310p.worker.v2.model_state import Ascend310PMambaHybridModelState
 from vllm_ascend._310p.worker.v2.spec_utils import (
     combine_sampled_and_draft_tokens_cpu,
     expand_idx_mapping_cpu,
@@ -186,21 +187,19 @@ class NPUModelRunner310V2(NPUModelRunner):
 
         parallel_config = vllm_config.parallel_config
         # TODO: Restore data parallel support in the next 310P MRV2 iteration.
-        # Pipeline and context parallelism remain unsupported on 310P.
         unsupported_parallel = {
-            "pipeline_parallel_size": getattr(parallel_config, "pipeline_parallel_size", 1),
             "data_parallel_size": getattr(parallel_config, "data_parallel_size", 1),
             "decode_context_parallel_size": getattr(parallel_config, "decode_context_parallel_size", 1),
             "prefill_context_parallel_size": getattr(parallel_config, "prefill_context_parallel_size", 1),
         }
         enabled = [name for name, size in unsupported_parallel.items() if size != 1]
         if enabled:
-            raise NotImplementedError(
-                f"310P model runner v2 only supports tensor parallelism; unsupported settings: {', '.join(enabled)}."
-            )
+            raise NotImplementedError(f"310P model runner v2 unsupported parallel settings: {', '.join(enabled)}.")
         if getattr(parallel_config, "enable_expert_parallel", False):
             raise NotImplementedError("Expert parallelism is not supported by model runner v2 on 310P.")
         if vllm_config.speculative_config is not None:
+            if parallel_config.pipeline_parallel_size > 1:
+                raise NotImplementedError("310P PP does not yet handle speculative draft state.")
             spec = vllm_config.speculative_config
             # Bare objects (UT fixtures) and non-MTP methods are out of scope.
             method = getattr(spec, "method", None)
@@ -274,6 +273,10 @@ class NPUModelRunner310V2(NPUModelRunner):
         )
         idx_mapping = self._idx_mapping.gpu[:num_reqs]
         self._idx_mapping.copy_to_gpu(num_reqs)
+        if getattr(self, "pp_handler", None) is not None and not self.is_last_pp_rank:
+            # PPHandler keeps both mappings after these staging buffers are reused.
+            idx_mapping_np = idx_mapping_np.copy()
+            idx_mapping = idx_mapping.clone()
         # Preserve batch order for host-side postprocessing.
         self._postprocess_idx_mapping_np = idx_mapping_np
 
@@ -1347,6 +1350,11 @@ class NPUModelRunner310V2(NPUModelRunner):
             num_sampled = self._num_sampled_staging.gpu[:num_reqs]
             self._num_sampled_staging.copy_to_gpu(num_reqs)
             num_rejected = self._num_rejected_staging.gpu[:num_reqs]
+            if getattr(self, "pp_handler", None) is not None:
+                sampler_output.sampled_token_ids = sampler_output.sampled_token_ids.to(torch.int64)
+                # The PP broadcast stream may still be reading last step's counts.
+                num_sampled = num_sampled.clone()
+                num_rejected = num_rejected.clone()
             sampler_output.num_sampled = num_sampled
             sampler_output.num_rejected = num_rejected
             return sampler_output, num_sampled, num_rejected
@@ -1373,6 +1381,43 @@ class NPUModelRunner310V2(NPUModelRunner):
         draft_tokens: torch.Tensor | None = None,
     ) -> None:
         """Run request bookkeeping on CPU; upload only immediate NPU consumers."""
+        if getattr(self, "pp_handler", None) is not None and not self.is_last_pp_rank:
+            # The receive belongs to an earlier batch. Negative rows are freed
+            # or did not need a sample. Computed lengths advanced at dispatch.
+            rows = idx_mapping.cpu()
+            counts = num_sampled.cpu()
+            live = (rows >= 0) & (counts > 0)
+            rows = rows[live].long()
+            if rows.numel():
+                tokens = sampled_tokens.cpu()[live]
+                counts = counts[live]
+                _post_update_cpu(
+                    rows.numpy(),
+                    None,
+                    self.req_states,
+                    tokens,
+                    counts,
+                    num_rejected.cpu()[live],
+                    update_computed=False,
+                )
+                self.req_states.last_sampled_tokens.index_copy_(
+                    0, rows.to(self.device), tokens[:, :1].to(self.req_states.last_sampled_tokens)
+                )
+                if (
+                    isinstance(self.model_state, Ascend310PMambaHybridModelState)
+                    and self.cache_config.mamba_cache_mode == "align"
+                ):
+                    # Deferred rows need the request-indexed CPU tables. The
+                    # gathered tables are sized and ordered for a newer batch.
+                    self.model_state.postprocess_state(
+                        rows,
+                        counts,
+                        self.req_states.num_computed_tokens_cpu,
+                        block_tables_np=tuple(table[rows.numpy()] for table in self.block_tables.block_tables_cpu),
+                    )
+                else:
+                    self.model_state.postprocess_state(rows, counts, self.req_states.num_computed_tokens_cpu)
+            return
         # Device arguments remain for upstream API compatibility.
         del num_sampled, num_rejected, query_start_loc, draft_tokens
         if self._sampled_tokens_cpu is not None and self.rejection_sampler is not None:
@@ -1489,5 +1534,10 @@ class NPUModelRunner310V2(NPUModelRunner):
         return changed_req_indices
 
     def postprocess_num_computed_tokens(self, input_batch: Ascend310PInputBatch) -> None:
-        # ``postprocess_sampled`` already advances CPU-owned request state.
-        del input_batch
+        # Non-final prefill chunks may never receive sampled tokens.
+        if getattr(self, "pp_handler", None) is not None and not self.is_last_pp_rank:
+            for row, req_idx in enumerate(input_batch.idx_mapping_np):
+                computed = int(input_batch.num_computed_tokens_np[row]) + int(input_batch.num_scheduled_tokens[row])
+                self.req_states.num_computed_tokens_np[req_idx] = computed
+                self.req_states.num_computed_tokens_cpu[req_idx] = computed
+                self.req_states.num_computed_tokens.stage_write_elem(int(req_idx), computed)

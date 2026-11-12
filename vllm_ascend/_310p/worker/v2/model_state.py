@@ -441,7 +441,10 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
         idx_mapping: torch.Tensor,
         num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None = None,
+        *,
+        block_tables_np: tuple[np.ndarray, ...] | None = None,
     ) -> None:
+        idx_mapping = idx_mapping.cpu()
         num_reqs = idx_mapping.shape[0]
         if num_reqs:
             idx_mapping_np = idx_mapping.numpy()
@@ -477,7 +480,8 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
 
         if not self._align_mode or num_computed_tokens is None:
             return
-        block_tables_np = self._current_mamba_block_tables_np
+        if block_tables_np is None:
+            block_tables_np = self._current_mamba_block_tables_np
         if block_tables_np is None:
             return
         block_size = self._mamba_spec.block_size
