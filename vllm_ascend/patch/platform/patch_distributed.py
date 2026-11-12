@@ -32,17 +32,26 @@ class NullHandle:
 
 def communication_adaptation_310p():
     def broadcast310p_wrapper(fn):
-        def broadcast310p(tensor, src=0, group=None, async_op=False, group_src=None):
-            root = group_src if group_src is not None else src
+        def broadcast310p(tensor, src=None, group=None, async_op=False, group_src=None):
+            if group_src is not None and src is not None:
+                raise ValueError("Specify only one of src and group_src.")
+            if group_src is None and src is None:
+                src = 0
 
             if tensor.device == torch.device("cpu"):
-                return fn(tensor, src=root, group=group, async_op=async_op)
+                if group_src is not None:
+                    return fn(tensor, group_src=group_src, group=group, async_op=async_op)
+                return fn(tensor, src=src, group=group, async_op=async_op)
+            # all_gather orders its outputs by group rank, while src is global.
+            root = group_src if group_src is not None else src
+            if group_src is None and group is not None and group is not torch.distributed.group.WORLD:
+                root = torch.distributed.get_group_rank(group, src)
             rank = torch.distributed.get_rank(group)
             world_size = torch.distributed.get_world_size(group)
             tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]
             tensor_list[rank] = tensor
             torch.distributed.all_gather(tensor_list, tensor, group=group)
-            tensor[...] = tensor_list[src]
+            tensor[...] = tensor_list[root]
             if async_op:
                 return NullHandle()
             else:
